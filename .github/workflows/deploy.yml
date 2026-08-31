@@ -1,0 +1,66 @@
+name: Deploy staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install
+      - name: Run test suite
+        run: npm test
+
+  deploy:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # Servi depuis mvpcommande.github.io/Mvp-staging/ - pas de
+      # domaine personnalisé pour un environnement de test, donc
+      # base = le nom du dépôt, pas la racine.
+      # Identifiants du projet Supabase de TEST (kkhlpeqherxfdnilewkp),
+      # jamais ceux de production - c'est tout l'intérêt de ce dépôt.
+      - name: Build against the staging Supabase project
+        run: npx vite build --base=/Mvp-staging/
+        env:
+          VITE_SUPABASE_URL: https://kkhlpeqherxfdnilewkp.supabase.co
+          VITE_SUPABASE_PUBLISHABLE_KEY: sb_publishable_yHK0CsWF2mYRRyAauMMW-Q_-AwHJXFl
+
+      - name: Publish to gh-pages
+        run: |
+          touch dist/.nojekyll
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git fetch origin gh-pages:gh-pages
+            git worktree add /tmp/gh-pages-deploy gh-pages
+          else
+            git worktree add --orphan -b gh-pages /tmp/gh-pages-deploy
+          fi
+
+          rm -rf /tmp/gh-pages-deploy/*
+          cp -r dist/. /tmp/gh-pages-deploy/
+          cd /tmp/gh-pages-deploy
+          git add -A
+          git diff --staged --quiet && echo "Rien à déployer" && exit 0
+          git commit -m "Deploy ${{ github.sha }}"
+          git push origin gh-pages

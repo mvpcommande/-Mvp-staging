@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#171714" />
+    <title>FOODATOI — Votre commande, votre marge</title>
+    <meta
+      name="description"
+      content="La plateforme de commande directe pour restaurateurs. Zéro commission cachée, vos données vous appartiennent, en ligne rapidement."
+    />
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+      :root {
+        --ink: #171714;
+        --paper: #f3efe7;
+        --card: #fffdf8;
+        --line: #d9d2c6;
+        --muted: #777267;
+        --hot: #e84d27;
+        --acid: #d7e95b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: 'DM Sans', -apple-system, sans-serif;
+      }
+
+      h1,
+      h2,
+      h3 {
+        font-family: 'Space Grotesk', -apple-system, sans-serif;
+      }
+
+      .wrap {
+        width: min(1080px, 100%);
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+
+      header.top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 22px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .wordmark {
+        font: 700 15px 'Space Grotesk', sans-serif;
+        letter-spacing: -0.02em;
+      }
+
+      .wordmark span {
+        color: var(--hot);
+      }
+
+      .top .cta-link {
+        border: 1px solid var(--ink);
+        padding: 9px 16px;
+        text-decoration: none;
+        color: var(--ink);
+        font-weight: 700;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .hero {
+        padding: 80px 0 60px;
+      }
+
+      .eyebrow {
+        font: 500 11px 'DM Mono', monospace;
+        letter-spacing: 0.13em;
+        color: var(--muted);
+        margin: 0 0 16px;
+      }
+
+      .hero h1 {
+        font-size: clamp(40px, 7vw, 72px);
+        line-height: 0.98;
+        letter-spacing: -0.03em;
+        margin: 0 0 24px;
+        max-width: 780px;
+      }
+
+      .hero h1 em {
+        font-style: normal;
+        color: var(--hot);
+      }
+
+      .hero p {
+        font-size: 18px;
+        line-height: 1.55;
+        color: #4c463d;
+        max-width: 540px;
+        margin: 0 0 32px;
+      }
+
+      .primary-cta {
+        display: inline-block;
+        background: var(--ink);
+        color: #fff;
+        padding: 16px 26px;
+        text-decoration: none;
+        font-weight: 800;
+        font-size: 15px;
+      }
+
+      .stat-band {
+        background: var(--ink);
+        color: #fff;
+        padding: 56px 0;
+      }
+
+      .stat-band .wrap {
+        display: flex;
+        align-items: center;
+        gap: 40px;
+        flex-wrap: wrap;
+      }
+
+      .stat-number {
+        font: 700 96px/0.9 'Space Grotesk', sans-serif;
+        color: var(--acid);
+        flex-shrink: 0;
+      }
+
+      .stat-band p {
+        font-size: 17px;
+        line-height: 1.6;
+        color: #d8d4cb;
+        max-width: 460px;
+        margin: 0;
+      }
+
+      .stat-band strong {
+        color: #fff;
+      }
+
+      .showcase {
+        padding: 70px 0 20px;
+      }
+
+      .showcase h2 {
+        font-size: clamp(30px, 5vw, 44px);
+        letter-spacing: -0.03em;
+        margin: 0 0 40px;
+        max-width: 620px;
+      }
+
+      .showcase-item {
+        margin-bottom: 50px;
+      }
+
+      .showcase-item:last-child {
+        margin-bottom: 0;
+      }
+
+      .showcase-item img {
+        display: block;
+        border: 1px solid var(--line);
+        box-shadow: 0 20px 60px rgba(25, 21, 15, 0.12);
+      }
+
+      .showcase-item .shot-phone {
+        width: 100%;
+        max-width: 340px;
+      }
+
+      .showcase-item .shot-wide {
+        width: 100%;
+      }
+
+      .showcase-item p {
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 15px;
+        max-width: 520px;
+      }
+
+      .hidden {
+        display: none;
+      }
+
+      .view-toggle {
+        display: flex;
+        gap: 8px;
+        padding-bottom: 20px;
+      }
+
+      .view-btn {
+        border: 1px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        padding: 10px 18px;
+        font: 700 13px 'DM Sans', sans-serif;
+        cursor: pointer;
+      }
+
+      .view-btn.is-active {
+        background: var(--ink);
+        color: #fff;
+      }
+
+      .features {
+        padding: 70px 0;
+      }
+
+      .features h2 {
+        font-size: clamp(30px, 5vw, 44px);
+        letter-spacing: -0.03em;
+        margin: 0 0 40px;
+        max-width: 620px;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 14px;
+      }
+
+      .feature-card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        padding: 26px;
+      }
+
+      .feature-card h3 {
+        font-size: 20px;
+        letter-spacing: -0.02em;
+        margin: 0 0 10px;
+      }
+
+      .feature-card p {
+        font-size: 14px;
+        line-height: 1.55;
+        color: var(--muted);
+        margin: 0;
+      }
+
+      .closing {
+        border-top: 1px solid var(--line);
+        padding: 80px 0 90px;
+        text-align: center;
+      }
+
+      .closing h2 {
+        font-size: clamp(32px, 6vw, 52px);
+        letter-spacing: -0.03em;
+        margin: 0 0 20px;
+      }
+
+      .closing p {
+        color: var(--muted);
+        font-size: 16px;
+        margin: 0 0 28px;
+      }
+
+      .closing .primary-cta {
+        font-size: 17px;
+        padding: 18px 34px;
+      }
+
+      footer.bottom {
+        border-top: 1px solid var(--line);
+        padding: 26px 0;
+        font: 500 11px 'DM Mono', monospace;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      @media (max-width: 700px) {
+        .feature-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .stat-number {
+          font-size: 72px;
+        }
+
+        .top .cta-link {
+          padding: 8px 12px;
+          font-size: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <div class="wordmark">FOOD<span>A</span>TOI</div>
+      <a class="cta-link" href="mailto:digitalagenceoccitane@gmail.com">
+        Nous contacter
+      </a>
+    </header>
+
+    <main>
+      <section class="hero wrap">
+        <p class="eyebrow">FOODATOI · POUR RESTAURATEURS</p>
+        <h1>
+          Votre commande.<br />
+          <em>Votre marge.</em>
+        </h1>
+        <p>
+          Une plateforme de commande directe pensée pour reprendre
+          la main sur vos ventes à emporter — sans reverser une
+          partie de chaque commande à une plateforme.
+        </p>
+        <a class="primary-cta" href="mailto:digitalagenceoccitane@gmail.com">
+          Nous contacter →
+        </a>
+      </section>
+
+      <div class="view-toggle wrap">
+        <button
+          class="view-btn is-active"
+          data-view="commercant"
+          type="button"
+        >
+          Vue commerçant
+        </button>
+        <button
+          class="view-btn"
+          data-view="technique"
+          type="button"
+        >
+          Vue technique
+        </button>
+      </div>
+
+      <div id="view-commercant">
+      <section class="stat-band">
+        <div class="wrap">
+          <div class="stat-number">6%</div>
+          <p>
+            C'est la commission Uber Eats sur une commande à
+            emporter — jusqu'à 30% en livraison.
+            <strong>Avec FOODATOI, vous gardez tout.</strong>
+          </p>
+        </div>
+      </section>
+
+      <section class="showcase wrap">
+        <h2>Le produit, pas une promesse.</h2>
+
+        <div class="showcase-item">
+          <img
+            class="shot-phone"
+            src="marketing/screenshot-menu.png"
+            alt="Carte de commande FOODATOI avec vraies photos des plats"
+          />
+          <p>
+            Vos clients commandent sur une carte pensée pour
+            donner envie — vraies photos de vos plats, pas des
+            icônes génériques.
+          </p>
+        </div>
+
+        <div class="showcase-item">
+          <img
+            class="shot-wide"
+            src="marketing/screenshot-comptoir.png"
+            alt="Comptoir FOODATOI avec suivi des commandes en direct et économie de commission"
+          />
+          <p>
+            Votre comptoir reçoit les commandes en direct, et
+            affiche ce que vous économisez face aux plateformes —
+            en euros, pas en théorie.
+          </p>
+        </div>
+      </section>
+
+      <section class="features wrap">
+        <h2>Une plateforme à vous, pas un intermédiaire.</h2>
+
+        <div class="feature-grid">
+          <div class="feature-card">
+            <h3>Zéro commission cachée</h3>
+            <p>
+              Un abonnement fixe, pas un pourcentage prélevé sur
+              chaque vente. Ce que vous vendez reste ce que vous
+              gardez.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <h3>Vos données, chez vous</h3>
+            <p>
+              Coordonnées clients, historique de commandes,
+              fidélité : hébergés pour votre restaurant, jamais
+              revendus à un tiers.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <h3>Comptoir en temps réel</h3>
+            <p>
+              Les commandes arrivent en direct sur votre tablette
+              ou votre téléphone, sans avoir à recharger la page.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <h3>En ligne rapidement</h3>
+            <p>
+              Menu, photos, horaires : une mise en place pensée
+              pour aller vite, pas des mois de développement.
+            </p>
+          </div>
+        </div>
+      </section>
+      </div>
+
+      <div id="view-technique" class="hidden">
+        <section class="features wrap">
+          <p class="eyebrow">CÔTÉ TECHNIQUE</p>
+          <h2>Comment c'est construit.</h2>
+
+          <div class="feature-grid">
+            <div class="feature-card">
+              <h3>Isolation stricte par établissement</h3>
+              <p>
+                Chaque restaurant est isolé au niveau de la base
+                de données (règles de sécurité PostgreSQL), pas
+                seulement dans l'application. Impossible qu'un
+                établissement voie les données d'un autre, même
+                en cas de bug côté interface.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <h3>Rien n'est confié au navigateur</h3>
+              <p>
+                Les prix et les horaires d'ouverture sont
+                revérifiés côté serveur à chaque commande. Un
+                prix ne peut pas être falsifié depuis les outils
+                de développement du navigateur.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <h3>Temps réel natif</h3>
+              <p>
+                Les commandes arrivent au comptoir par connexion
+                persistante (WebSocket), pas par rafraîchissement
+                de page ni vérification périodique.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <h3>RGPD par construction</h3>
+              <p>
+                Consentement marketing explicite et révocable à
+                tout moment, suppression de compte en un clic. Les
+                commandes sont anonymisées plutôt que supprimées,
+                pour rester conformes aux obligations de
+                conservation comptable françaises sans violer le
+                droit à l'effacement.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <h3>Fiabilité testée</h3>
+              <p>
+                Suite de tests automatisés exécutée à chaque
+                changement, intégration continue, supervision
+                programmée qui vérifie en continu que le service
+                répond.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <h3>Base ouverte, pas de boîte noire</h3>
+              <p>
+                Construit sur PostgreSQL (Supabase), déployé sur
+                infrastructure web standard — pas de dépendance à
+                une plateforme propriétaire fermée.
+              </p>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="closing wrap">
+        <h2>Prêt à reprendre la main sur vos commandes ?</h2>
+        <p>Parlons de votre restaurant.</p>
+        <a class="primary-cta" href="mailto:digitalagenceoccitane@gmail.com">
+          digitalagenceoccitane@gmail.com
+        </a>
+      </section>
+    </main>
+
+    <footer class="bottom">
+      FOODATOI
+    </footer>
+
+    <script>
+      document.querySelectorAll('.view-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          document.querySelectorAll('.view-btn').forEach(function (b) {
+            b.classList.remove('is-active');
+          });
+          btn.classList.add('is-active');
+
+          var view = btn.dataset.view;
+
+          document.getElementById('view-commercant').classList.toggle(
+            'hidden',
+            view !== 'commercant'
+          );
+          document.getElementById('view-technique').classList.toggle(
+            'hidden',
+            view !== 'technique'
+          );
+        });
+      });
+    </script>
+  </body>
+</html>

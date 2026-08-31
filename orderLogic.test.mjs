@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { addItem, calculateTotal, createOrder } from './orderLogic.mjs';
+const cart = [];
+const one = addItem(cart, { id: 'kebab', name: 'Kebab', price: 8, options: { sauce: 'Blanche' } });
+const two = addItem(one, { id: 'kebab', name: 'Kebab', price: 8, options: { sauce: 'Algérienne' } });
+assert.equal(two.length, 2);
+assert.equal(calculateTotal([{ price: 8, quantity: 2 }, { price: 6.5, quantity: 1 }]), 22.5);
+const order = createOrder([{ id: 'kebab', name: 'Kebab', price: 8, quantity: 1, options: {} }], { name: 'Kevin', phone: '0600000000', pickupTime: '20:15' }, () => 123);
+assert.equal(order.type, 'PICKUP');
+assert.equal(order.number, '#123');
+assert.equal(order.customer.name, 'Kevin');
+assert.equal(order.total, 8);
+console.log('PASS');
