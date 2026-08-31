@@ -1,0 +1,1 @@
+async function e(e,{restaurantId:t,context:n,message:r,details:i,page:a}){if(e)try{await e.from(`client_error_logs`).insert({restaurant_id:t??null,context:n,message:String(r??``).slice(0,2e3),details:i??null,page:a??null,user_agent:typeof navigator<`u`?navigator.userAgent:null})}catch{}}export{e as t};
