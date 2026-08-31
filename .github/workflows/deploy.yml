@@ -39,7 +39,7 @@ jobs:
       # Identifiants du projet Supabase de TEST (kkhlpeqherxfdnilewkp),
       # jamais ceux de production - c'est tout l'intérêt de ce dépôt.
       - name: Build against the staging Supabase project
-        run: npx vite build --base=/Mvp-staging/
+        run: npx vite build --base=/-Mvp-staging/
         env:
           VITE_SUPABASE_URL: https://kkhlpeqherxfdnilewkp.supabase.co
           VITE_SUPABASE_PUBLISHABLE_KEY: sb_publishable_yHK0CsWF2mYRRyAauMMW-Q_-AwHJXFl
