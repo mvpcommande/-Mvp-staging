@@ -183,23 +183,6 @@ const itemCount = () =>
     0
   );
 
-/**
- * Estimation d'affichage uniquement (écran "ticket" du panier,
- * avant le choix réel du créneau) : heure actuelle + 20 min,
- * Europe/Paris. Ne détermine jamais l'heure de retrait envoyée en
- * base — ça reste pickupTime, choisi à l'étape suivante.
- */
-function estimatedPickupLabel() {
-  const estimate = new Date(Date.now() + 20 * 60 * 1000);
-
-  return new Intl.DateTimeFormat('fr-FR', {
-    timeZone: 'Europe/Paris',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23'
-  }).format(estimate);
-}
-
 function restaurantOpenNow() {
   return isRestaurantOpen(
     restaurant?.settings?.opening_hours,
@@ -208,14 +191,15 @@ function restaurantOpenNow() {
 }
 
 /**
- * Délai de retrait affiché dans le header. N'existe que si le
- * restaurant l'a explicitement configuré dans settings (aucune
- * colonne dédiée) : un nombre unique (pickup_eta_minutes) ou une
- * fourchette (pickup_eta_min / pickup_eta_max). Sans configuration,
- * on n'affiche rien plutôt que d'inventer un délai identique pour
- * tous les restaurants.
+ * Configuration ETA du restaurant (settings, aucune colonne
+ * dédiée) : soit une fourchette (pickup_eta_min / pickup_eta_max),
+ * soit une valeur unique (pickup_eta_minutes). Retourne null si
+ * rien n'est configuré — c'est la seule source de vérité, jamais
+ * de délai inventé côté client. Factorisé ici car réutilisé par le
+ * header (getPickupEtaLabel) et par l'estimation du panier
+ * (getCartEtaLabel), qui n'en affichent pas le même format.
  */
-function getPickupEtaLabel() {
+function getPickupEtaConfig() {
   const settings = restaurant?.settings || {};
 
   const min = Number(settings.pickup_eta_min);
@@ -227,16 +211,63 @@ function getPickupEtaLabel() {
     min > 0 &&
     max >= min
   ) {
-    return `Retrait ${min}–${max} min`;
+    return { type: 'range', min, max };
   }
 
-  const single = Number(settings.pickup_eta_minutes);
+  const minutes = Number(settings.pickup_eta_minutes);
 
-  if (Number.isFinite(single) && single > 0) {
-    return `Retrait ~${single} min`;
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return { type: 'single', minutes };
   }
 
   return null;
+}
+
+/**
+ * Délai de retrait affiché dans le header. Sans configuration, on
+ * n'affiche rien plutôt que d'inventer un délai identique pour
+ * tous les restaurants.
+ */
+function getPickupEtaLabel() {
+  const config = getPickupEtaConfig();
+
+  if (!config) {
+    return null;
+  }
+
+  return config.type === 'range'
+    ? `Retrait ${config.min}–${config.max} min`
+    : `Retrait ~${config.minutes} min`;
+}
+
+/**
+ * Estimation affichée dans l'écran "ticket" du panier
+ * (renderCartReview), purement informative : ne détermine jamais
+ * l'heure de retrait envoyée en base — ça reste pickupTime, choisi
+ * à l'étape suivante. Null si aucune ETA n'est configurée pour ce
+ * restaurant, auquel cas la ligne est masquée.
+ */
+function getCartEtaLabel() {
+  const config = getPickupEtaConfig();
+
+  if (!config) {
+    return null;
+  }
+
+  if (config.type === 'range') {
+    return `Retrait estimé : ${config.min}–${config.max} min`;
+  }
+
+  const estimate = new Date(Date.now() + config.minutes * 60 * 1000);
+
+  const timeLabel = new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).format(estimate);
+
+  return `Retrait estimé vers ${timeLabel}`;
 }
 
 /**
@@ -2341,6 +2372,7 @@ function renderCart() {
 
 function renderCartReview(element) {
   const subtotal = calculateTotal(cart);
+  const cartEtaLabel = getCartEtaLabel();
 
   element.innerHTML = `
     <div class="oi-cart-items">
@@ -2360,9 +2392,7 @@ function renderCartReview(element) {
       </div>
     </div>
 
-    <p class="oi-cart-estimate">
-      Retrait estimé <strong>${estimatedPickupLabel()}</strong>
-    </p>
+    ${cartEtaLabel ? `<p class="oi-cart-estimate">${escapeHtml(cartEtaLabel)}</p>` : ''}
 
     <div class="oi-sheet-cta">
       <button class="primary full" id="cart-continue" type="button">
