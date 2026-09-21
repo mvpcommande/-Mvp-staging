@@ -11,3 +11,199 @@
 .product-row{display:flex;flex-direction:column;gap:10px;border:1px solid var(--line);padding:12px 14px}.product-row-main span{display:block;color:var(--muted);font-size:12px;margin-top:2px}.product-row-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .identity-row{display:flex;align-items:center;gap:16px;margin-bottom:18px}.identity-logo-preview{width:64px;height:64px;background:var(--ink);color:var(--acid);display:grid;place-items:center;font:700 16px 'DM Mono';flex-shrink:0;overflow:hidden}.identity-logo-preview img{width:100%;height:100%;object-fit:cover}.color-picker-row{display:flex;align-items:center;gap:12px;font:500 10px 'DM Mono';letter-spacing:.05em}.color-picker-row input[type=color]{width:48px;height:36px;border:1px solid var(--line);padding:2px;background:#fffdf8;cursor:pointer}
 @media(max-width:600px){.pending-row{flex-direction:column;align-items:stretch}.pending-actions{width:100%}.pending-actions button{flex:1}}
+
+/* ============================================================== */
+/* Refonte mobile-first de la commande client (Foodatoi)          */
+/* Scopée à #root (page client uniquement — n'affecte ni          */
+/* #admin-root, ni #onboarding-root, ni les autres entrées Vite). */
+/* ============================================================== */
+
+:root{
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-6:24px;--sp-8:32px;
+  --radius-sm:8px;--radius-md:12px;--radius-lg:16px;--radius-pill:999px;
+  --acid-ink:#3f4a12;
+}
+
+#root button,#root input,#root select,#root textarea{font-family:inherit}
+#root :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+@media(max-width:700px){
+  .client-app{padding-bottom:calc(96px + env(safe-area-inset-bottom))}
+}
+
+/* -- Header compact ------------------------------------------------ */
+.oi-header{padding:var(--sp-3) 0 var(--sp-2)}
+.oi-header-row{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3)}
+.oi-brand-meta{display:flex;flex-direction:column;gap:2px;min-width:0}
+.oi-brand-meta strong{font:700 clamp(18px,4.5vw,22px)/1.15 'Space Grotesk';letter-spacing:-.01em;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.oi-status-line{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+/*
+ * Deux anciennes règles ciblent tout <span> descendant de
+ * ".brand-lockup" à n'importe quelle profondeur — ".brand-lockup div
+ * span{display:none}" (mobile, masquait l'ancien sous-titre secteur)
+ * et ".brand-lockup div span{font:400 9px...}" (base) — et matchent
+ * donc aussi, sans le vouloir, ces spans une fois imbriqués dans le
+ * nouveau header. Plutôt que de toucher ces règles partagées, on les
+ * bat proprement par spécificité (deux classes > une classe + deux
+ * types) en qualifiant avec ".oi-header", l'ancêtre réel de ces
+ * éléments — pas de !important nécessaire.
+ */
+.oi-header .oi-status-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:var(--radius-pill);font:700 11px 'DM Mono';letter-spacing:.02em}
+.oi-header .oi-status-badge.is-open{background:rgba(215,233,91,.4);color:var(--acid-ink)}
+.oi-header .oi-status-badge.is-closed{background:rgba(23,23,20,.07);color:var(--muted)}
+.oi-header .oi-status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin:0}
+.oi-header .oi-eta{display:inline;font:500 11px 'DM Mono';color:var(--muted);margin:0}
+.oi-tagline{margin:var(--sp-2) 0 0;font:600 15px 'DM Sans';color:#555047;letter-spacing:-.01em}
+.oi-tagline em{font-style:normal;color:var(--hot)}
+
+.brand-lockup{gap:10px}
+.masthead-actions{gap:6px}
+#root .icon-btn{width:42px;height:42px;min-width:44px;min-height:44px;display:grid;place-items:center;color:var(--ink);flex-shrink:0}
+.oi-cart-btn{position:relative}
+.oi-cart-badge{position:absolute;top:-4px;right:-4px;min-width:18px;height:18px;padding:0 4px;border-radius:999px;background:var(--acid);color:var(--acid-ink);font:700 10px 'DM Mono';display:grid;place-items:center}
+
+/* -- Mode de commande (segmented control) --------------------------- */
+.oi-mode-section{padding:var(--sp-2) 0 var(--sp-3)}
+.oi-mode-label{margin:0 0 var(--sp-2);font:600 13px 'DM Sans';color:var(--ink)}
+.oi-segmented{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-md);padding:4px}
+.oi-segmented-btn{flex:1;min-height:44px;border:0;background:transparent;border-radius:calc(var(--radius-md) - 4px);font:700 13px 'DM Sans';color:var(--muted);cursor:pointer;transition:background .15s ease,color .15s ease}
+.oi-segmented-btn.is-active{background:var(--acid);color:var(--acid-ink)}
+
+/* -- Bannières (fermé / livraison) ----------------------------------- */
+.oi-closed-banner{margin-bottom:var(--sp-3);box-shadow:none}
+.oi-delivery-banner{border-top:0;border:1px solid var(--line);background:var(--card);padding:var(--sp-3) var(--sp-4);margin-bottom:var(--sp-3);border-radius:var(--radius-md);gap:var(--sp-3)}
+.oi-delivery-banner p.eyebrow{margin-bottom:4px}
+.oi-delivery-banner p:not(.eyebrow){font-size:13px}
+
+/* -- Catégories (rail sticky) ---------------------------------------- */
+.oi-cat-rail{margin:0 0 var(--sp-4);padding:var(--sp-2) 0;gap:6px;border-bottom:1px solid var(--line)}
+.oi-chip{min-height:44px;padding:9px 15px;border-radius:var(--radius-pill);background:var(--card);border-color:var(--line);font:600 12.5px 'DM Sans';letter-spacing:0;color:#575148}
+.oi-chip.is-active{background:var(--acid);border-color:var(--acid);color:var(--acid-ink)}
+
+/* -- Sections / cartes produit --------------------------------------- */
+.oi-menu{padding-top:var(--sp-2)}
+.oi-section{scroll-margin-top:56px}
+.oi-section + .oi-section{margin-top:var(--sp-8);padding-top:var(--sp-8);border-top:1px solid var(--line)}
+.oi-section-head{margin:0 0 var(--sp-3)}
+.oi-section-head h2{margin:0;font:700 21px/1.2 'Space Grotesk';letter-spacing:-.02em;color:var(--ink)}
+.oi-card-list{display:flex;flex-direction:column;gap:var(--sp-3)}
+
+.oi-card{position:relative;display:flex;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);padding:var(--sp-3)}
+.oi-card-main{flex:1;min-width:0;display:flex;align-items:flex-start;gap:var(--sp-3);background:none;border:0;padding:0;margin:0;text-align:left;font:inherit;color:inherit;cursor:pointer}
+.oi-card-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;padding-bottom:34px}
+.oi-card-badges{display:flex;gap:6px;margin-bottom:2px}
+.oi-badge{display:inline-block;padding:3px 7px;border-radius:6px;font:700 10px 'DM Mono';letter-spacing:.02em;text-transform:uppercase}
+.oi-badge--acid{background:var(--acid);color:var(--acid-ink)}
+.oi-badge--ink{background:var(--ink);color:#fff}
+.oi-card-name{font:700 16px/1.25 'DM Sans';color:var(--ink)}
+.oi-card-desc{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font:400 13px/1.4 'DM Sans';color:var(--muted)}
+.oi-card-price{margin-top:2px;font:700 15px 'DM Sans';color:var(--ink)}
+.oi-card-media{flex-shrink:0;width:84px;height:84px;border-radius:var(--radius-md);overflow:hidden;background:var(--paper)}
+.oi-card-media img{width:100%;height:100%;object-fit:cover;display:block}
+.oi-card--no-photo .oi-card-text{padding-bottom:var(--sp-2);padding-right:56px}
+
+.oi-add-btn{position:absolute;right:var(--sp-3);bottom:var(--sp-3);width:40px;height:40px;min-width:44px;min-height:44px;margin:-2px;border-radius:50%;background:var(--acid);color:var(--acid-ink);border:0;display:grid;place-items:center;font:700 20px/1 'DM Sans';cursor:pointer}
+.oi-add-btn span{transform:translateY(-1px)}
+
+/* -- Barre panier sticky ---------------------------------------------- */
+.oi-sticky-cart{position:fixed;left:0;right:0;bottom:0;z-index:15;padding:var(--sp-3) var(--sp-4) calc(var(--sp-3) + env(safe-area-inset-bottom))}
+.oi-sticky-cart.hidden{display:none}
+.oi-sticky-cart-btn{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);width:min(1180px,100%);margin:0 auto;min-height:56px;padding:0 var(--sp-4);border:0;border-radius:var(--radius-md);background:var(--ink);color:#fff;box-shadow:0 8px 24px rgba(23,23,20,.22);cursor:pointer}
+.oi-sticky-cart-info{display:flex;align-items:baseline;gap:10px;font-weight:700}
+.oi-sticky-cart-count{font-size:13px;color:var(--acid)}
+.oi-sticky-cart-total{font:700 16px 'Space Grotesk'}
+.oi-sticky-cart-cta{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700}
+
+/* -- Tiroir panier / bottom sheet --------------------------------------- */
+#root .drawer{padding:var(--sp-4);width:min(460px,100%)}
+#root .drawer-head h2{font-size:26px}
+#root .ticket-paper{box-shadow:none;border:1px solid var(--line)}
+
+.oi-cart-items{display:flex;flex-direction:column}
+.oi-cart-item{display:flex;justify-content:space-between;gap:var(--sp-3);padding:var(--sp-3) 0;border-bottom:1px solid var(--line)}
+.oi-cart-item-main{display:flex;flex-direction:column;gap:3px;min-width:0}
+.oi-cart-item-main strong{font:600 14px 'DM Sans';color:var(--ink)}
+.oi-cart-item-options{font:400 12px 'DM Sans';color:var(--muted)}
+.oi-cart-item-actions{display:flex;gap:var(--sp-3);margin-top:4px}
+.oi-cart-item-actions button{border:0;background:none;padding:12px 0;margin:-12px 0;font:600 12px 'DM Sans';color:var(--ink);text-decoration:underline;cursor:pointer;min-height:44px;display:inline-flex;align-items:center}
+.oi-cart-item-actions button[data-remove]{color:var(--hot)}
+.oi-cart-item > b{flex-shrink:0;font:700 14px 'Space Grotesk';color:var(--ink)}
+
+.oi-cart-totals{margin-top:var(--sp-2);padding-top:var(--sp-3);border-top:1px dashed var(--line);display:flex;flex-direction:column;gap:6px}
+.oi-cart-total-row{display:flex;justify-content:space-between;font:500 13px 'DM Sans';color:var(--muted)}
+.oi-cart-total-row--grand{color:var(--ink);font-weight:700;font-size:15px}
+.oi-cart-total-row--grand strong{font:700 20px 'Space Grotesk'}
+.oi-cart-estimate{margin:var(--sp-3) 0 0;font-size:13px;color:var(--muted)}
+.oi-cart-estimate strong{color:var(--ink)}
+
+/*
+ * Pas de marge négative "plein bord" ici : combinée à
+ * position:sticky, elle fausse le calcul de la position "statique"
+ * de l'élément (Chromium le colle alors trop tôt, en chevauchement
+ * avec les champs précédents). On reste dans le flux normal du
+ * formulaire, juste avec un fond plein pour ne pas laisser
+ * transparaître le contenu qui défile derrière une fois collé.
+ */
+.oi-sheet-cta{position:sticky;bottom:0;margin-top:var(--sp-4);padding:var(--sp-3) 0 calc(var(--sp-3) + env(safe-area-inset-bottom));background:var(--paper)}
+#root .oi-sheet-cta .primary{background:var(--acid);color:var(--acid-ink)}
+.oi-sheet-cta small{display:block;margin-top:8px;text-align:center;color:var(--muted)}
+
+.oi-back-link{display:inline-flex;align-items:center;gap:4px;border:0;background:none;padding:0 0 var(--sp-3);font:600 13px 'DM Sans';color:var(--ink);cursor:pointer;min-height:32px}
+
+.oi-checkout-form .eyebrow.oi-form-section{margin-top:var(--sp-4)}
+.oi-mode-readout{margin:0 0 var(--sp-2);padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);font:600 13px 'DM Sans'}
+.oi-payment-note{margin:var(--sp-2) 0 0;font:500 12px 'DM Mono';color:var(--muted)}
+
+/* -- Configurateur (bottom sheet produit) -------------------------------- */
+#root .modal.oi-sheet{align-items:flex-end;padding:0}
+#root .modal.oi-sheet .modal-card{width:100%;max-width:640px;margin:0 auto;max-height:88vh;border-radius:var(--radius-lg) var(--radius-lg) 0 0;padding:var(--sp-4);display:flex;flex-direction:column}
+.oi-sheet-scroll{overflow-y:auto;flex:1;padding-bottom:var(--sp-3)}
+.oi-sheet-desc{color:var(--muted);font-size:13px;line-height:1.5}
+.oi-sheet-price{font:700 18px 'Space Grotesk';margin:4px 0 0}
+.oi-sheet-fields{display:flex;flex-direction:column;gap:var(--sp-4);margin-top:var(--sp-4)}
+
+.oi-field-label{display:flex;align-items:center;gap:8px;margin:0 0 var(--sp-2);font:700 13px 'DM Sans';color:var(--ink)}
+.oi-field-required{font:600 10px 'DM Mono';letter-spacing:.03em;color:var(--hot);text-transform:uppercase}
+.oi-pill-group{display:flex;flex-wrap:wrap;gap:8px}
+.oi-pill{position:relative}
+.oi-pill input{position:absolute;opacity:0;width:1px;height:1px}
+.oi-pill span{display:inline-flex;align-items:center;min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:var(--radius-pill);font:600 13px 'DM Sans';color:var(--ink);cursor:pointer;user-select:none}
+.oi-pill:has(input:checked) span{background:var(--ink);border-color:var(--ink);color:#fff}
+.oi-pill:has(input:focus-visible) span{outline:2px solid var(--ink);outline-offset:2px}
+
+.oi-stepper{display:inline-flex;align-items:center;gap:var(--sp-3);border:1px solid var(--line);border-radius:var(--radius-pill);padding:2px 6px}
+.oi-stepper-btn{width:40px;height:40px;min-width:44px;min-height:44px;margin:-2px;border-radius:50%;border:0;background:var(--paper);color:var(--ink);font:700 18px 'DM Sans';cursor:pointer;display:grid;place-items:center}
+.oi-stepper-btn:disabled{opacity:.35;cursor:not-allowed}
+.oi-stepper-value{min-width:20px;text-align:center;font:700 15px 'DM Sans'}
+
+/* -- États (chargement / erreur) ------------------------------------------ */
+.oi-state-screen{max-width:420px;margin:0 auto;padding:18vh 0 40px;text-align:center}
+.oi-state-screen h1{font:700 clamp(24px,6vw,32px)/1.2 'Space Grotesk';letter-spacing:-.02em;margin:var(--sp-2) 0 var(--sp-2)}
+.oi-state-lede,.oi-state-hint{color:var(--muted);line-height:1.5;margin:0}
+.oi-state-hint{margin-top:var(--sp-2);font-size:13px}
+.oi-state-spinner{width:32px;height:32px;margin:0 auto var(--sp-4);border-radius:50%;border:3px solid var(--line);border-top-color:var(--ink);animation:oi-spin .8s linear infinite}
+@keyframes oi-spin{to{transform:rotate(360deg)}}
+
+/* -- Infos restaurant (modale) --------------------------------------------- */
+.oi-info-status{margin:var(--sp-2) 0 var(--sp-4)}
+.oi-info-row{margin:0 0 6px;font-size:14px;color:var(--ink)}
+.oi-info-row a{color:var(--ink)}
+.oi-info-hours{margin-top:var(--sp-3)}
+.oi-info-delivery{margin-top:var(--sp-4);text-align:center}
+
+/* -- Desktop : grille 2 colonnes, contenu maîtrisé ------------------------- */
+@media(min-width:701px){
+  .oi-card-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-3)}
+  .oi-sticky-cart{display:none}
+}
+@media(min-width:900px){
+  .oi-tagline{font-size:16px}
+}
+
+/* -- Petits mobiles (375px) : resserre encore les marges ------------------ */
+@media(max-width:390px){
+  .app-frame{padding-left:12px;padding-right:12px}
+  .oi-card-media{width:72px;height:72px}
+  .oi-card-text{padding-bottom:30px}
+}
+
