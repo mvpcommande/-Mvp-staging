@@ -208,6 +208,38 @@ function restaurantOpenNow() {
 }
 
 /**
+ * Délai de retrait affiché dans le header. N'existe que si le
+ * restaurant l'a explicitement configuré dans settings (aucune
+ * colonne dédiée) : un nombre unique (pickup_eta_minutes) ou une
+ * fourchette (pickup_eta_min / pickup_eta_max). Sans configuration,
+ * on n'affiche rien plutôt que d'inventer un délai identique pour
+ * tous les restaurants.
+ */
+function getPickupEtaLabel() {
+  const settings = restaurant?.settings || {};
+
+  const min = Number(settings.pickup_eta_min);
+  const max = Number(settings.pickup_eta_max);
+
+  if (
+    Number.isFinite(min) &&
+    Number.isFinite(max) &&
+    min > 0 &&
+    max >= min
+  ) {
+    return `Retrait ${min}–${max} min`;
+  }
+
+  const single = Number(settings.pickup_eta_minutes);
+
+  if (Number.isFinite(single) && single > 0) {
+    return `Retrait ~${single} min`;
+  }
+
+  return null;
+}
+
+/**
  * Un produit est "populaire" seulement si le restaurant l'a
  * explicitement marqué comme tel dans ses options (aucune
  * statistique de vente n'est inventée côté client).
@@ -225,24 +257,22 @@ function isPopular(item) {
   );
 }
 
-const NEW_PRODUCT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
-
 /**
- * "Nouveau" s'appuie sur la vraie date de création du produit
- * (déjà en base), pas sur une donnée fabriquée.
+ * "Nouveau" s'appuie uniquement sur une intention explicite du
+ * restaurant (option produit), jamais sur products.created_at : la
+ * date de création en base ne reflète pas la nouveauté commerciale
+ * (import de menu, resynchronisation, etc. peuvent la modifier sans
+ * rapport avec un vrai lancement produit).
  */
 function isNewProduct(item) {
-  if (!item.createdAt) {
-    return false;
-  }
+  const options = item.options || {};
 
-  const created = new Date(item.createdAt).getTime();
-
-  if (Number.isNaN(created)) {
-    return false;
-  }
-
-  return Date.now() - created < NEW_PRODUCT_WINDOW_MS;
+  return Boolean(
+    options.new ||
+    options.is_new ||
+    options.badge === 'nouveau' ||
+    options.badge === 'new'
+  );
 }
 
 /**
@@ -267,6 +297,47 @@ function getRestaurantDisplayName() {
     restaurant?.name ||
     'FOODATOI'
   );
+}
+
+/**
+ * Mots vides à ignorer pour le monogramme (articles/liaisons
+ * français les plus courants), pour éviter des initiales comme
+ * "LA" au lieu de "MM" sur "La Maison Métisse".
+ */
+const BRAND_INITIALS_STOPWORDS = new Set([
+  'le', 'la', 'les', 'l', 'un', 'une', 'des', 'du', 'de', 'd', 'et'
+]);
+
+/**
+ * Monogramme de repli quand logo_url est absent : initiales des
+ * mots significatifs du nom (jamais les 2 premières lettres brutes,
+ * qui donnent des résultats absurdes comme "Caz Food" -> "CA").
+ * Retourne '' si aucune initiale exploitable (le monogramme est
+ * alors masqué plutôt que d'afficher un rendu cassé).
+ */
+function getBrandInitials(name) {
+  const words = String(name || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (!words.length) {
+    return '';
+  }
+
+  const significant = words.filter(
+    word => !BRAND_INITIALS_STOPWORDS.has(
+      word.toLowerCase().replace(/['’]/g, '')
+    )
+  );
+
+  const source = significant.length ? significant : words;
+
+  return source
+    .slice(0, 2)
+    .map(word => word.charAt(0))
+    .join('')
+    .toUpperCase();
 }
 
 function getRestaurantPhone() {
@@ -691,6 +762,8 @@ function render() {
   const bestSellers = getBestSellers();
   const count = itemCount();
   const cartTotal = calculateTotal(cart);
+  const brandInitials = getBrandInitials(displayName);
+  const pickupEtaLabel = getPickupEtaLabel();
 
   app.innerHTML = `
     <div class="app-frame client-app">
@@ -704,7 +777,9 @@ function render() {
             ${
               restaurant?.logo_url
                 ? `<img class="brand-mark-image" src="${escapeHtml(restaurant.logo_url)}" alt="${escapeHtml(displayName)}">`
-                : `<span class="brand-mark">${escapeHtml(displayName.slice(0, 2).toUpperCase())}</span>`
+                : brandInitials
+                  ? `<span class="brand-mark">${escapeHtml(brandInitials)}</span>`
+                  : ''
             }
 
             <div class="oi-brand-meta">
@@ -714,7 +789,7 @@ function render() {
                   <span class="oi-status-dot"></span>
                   ${openNow ? 'Ouvert' : 'Fermé'}
                 </span>
-                <span class="oi-eta">Retrait 15–20 min</span>
+                ${pickupEtaLabel ? `<span class="oi-eta">${escapeHtml(pickupEtaLabel)}</span>` : ''}
               </div>
             </div>
 
