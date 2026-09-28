@@ -3,6 +3,10 @@ name: Deploy staging
 on:
   push:
     branches: [main]
+  # Valide aussi les PR (tests + build) sans jamais déployer : le job
+  # deploy ci-dessous est réservé aux push sur main.
+  pull_request:
+    branches: [main]
   workflow_dispatch: {}
 
 jobs:
@@ -14,12 +18,15 @@ jobs:
         with:
           node-version: 20
       - name: Install dependencies
-        run: npm install
+        run: npm ci
       - name: Run test suite
         run: npm test
+      - name: Build
+        run: npm run build
 
   deploy:
     needs: test-and-build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -31,7 +38,7 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       # Servi depuis mvpcommande.github.io/Mvp-staging/ - pas de
       # domaine personnalisé pour un environnement de test, donc

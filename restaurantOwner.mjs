@@ -256,10 +256,10 @@ export async function addProduct(client, restaurantId, fields) {
 }
 
 export async function updateRestaurantColor(client, restaurantId, color) {
-  const { error } = await client
-    .from('restaurants')
-    .update({ primary_color: color })
-    .eq('id', restaurantId);
+  const { error } = await client.rpc('update_restaurant_branding', {
+    p_restaurant_id: restaurantId,
+    p_primary_color: color
+  });
 
   if (error) {
     throw error;
@@ -282,10 +282,10 @@ export async function uploadRestaurantLogo(client, restaurantId, file) {
     data: { publicUrl }
   } = client.storage.from('restaurant-media').getPublicUrl(path);
 
-  const { error: updateError } = await client
-    .from('restaurants')
-    .update({ logo_url: publicUrl })
-    .eq('id', restaurantId);
+  const { error: updateError } = await client.rpc('update_restaurant_branding', {
+    p_restaurant_id: restaurantId,
+    p_logo_url: publicUrl
+  });
 
   if (updateError) {
     throw updateError;

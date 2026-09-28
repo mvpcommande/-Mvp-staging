@@ -1,5 +1,11 @@
 import './styles.css';
 import { supabase } from './supabaseClient.js';
+import { installGlobalErrorLogging } from './errorLog.mjs';
+installGlobalErrorLogging(supabase, {
+  page: 'platform',
+  getRestaurantId: () => null
+});
+
 import { escapeHtml } from './htmlEscape.mjs';
 import { signInOwner, signOutOwner } from './restaurantOwner.mjs';
 

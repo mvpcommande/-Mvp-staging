@@ -79,6 +79,67 @@ export function buildStockSummaryCsv(rows) {
   return [header.join(';'), ...lines].join('\n');
 }
 
+/**
+ * Filtre une liste de commandes sur une plage de dates (bornes
+ * incluses, comparées sur created_at). from/to au format YYYY-MM-DD
+ * ou null pour ne pas borner ce côté-là.
+ */
+export function filterOrdersByDateRange(orders, from, to) {
+  const fromTime = from ? new Date(`${from}T00:00:00`).getTime() : -Infinity;
+  const toTime = to ? new Date(`${to}T23:59:59.999`).getTime() : Infinity;
+
+  return (orders ?? []).filter((order) => {
+    const createdAt = new Date(order.createdAt ?? order.created_at).getTime();
+    return createdAt >= fromTime && createdAt <= toTime;
+  });
+}
+
+/**
+ * Export comptable : une ligne par commande (pas par produit comme
+ * le résumé stock), pensé pour être transmis tel quel à un
+ * comptable - numéro, date, montant, statut de paiement.
+ */
+export function buildAccountingCsv(orders) {
+  const escape = (value) => {
+    const text = String(value ?? '');
+    return /[;"\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+
+  const header = [
+    'Numéro de commande',
+    'Date',
+    'Heure de retrait',
+    'Client',
+    'Téléphone',
+    'Montant TTC (€)',
+    'Statut paiement',
+    'Statut commande'
+  ];
+
+  const lines = (orders ?? []).map((order) => {
+    const created = new Date(order.createdAt ?? order.created_at);
+    const dateStr = Number.isNaN(created.getTime())
+      ? ''
+      : created.toLocaleDateString('fr-FR');
+
+    return [
+      order.number ?? order.order_number ?? '',
+      dateStr,
+      formatPickupTime(order.pickupTime ?? order.pickup_time),
+      order.customer?.name ?? order.customer_name ?? '',
+      order.customer?.phone ?? order.customer_phone ?? '',
+      ((order.total ?? (order.total_cents ?? 0) / 100)).toFixed(2).replace('.', ','),
+      order.paymentStatus ?? order.payment_status ?? '',
+      order.status ?? ''
+    ]
+      .map(escape)
+      .join(';');
+  });
+
+  return [header.join(';'), ...lines].join('\n');
+}
+
+
 export function printStockSummary(
   rows,
   meta = {},
@@ -112,7 +173,7 @@ export function printStockSummary(
     <html lang="fr">
       <head>
         <meta charset="utf-8">
-        <title>Résumé stock — Caz Food</title>
+        <title>Résumé stock — ${meta.restaurantName ?? 'FOODATOI'}</title>
 
         <style>
           body { font: 13px/1.4 sans-serif; margin: 0; padding: 24px; color: #111; }
@@ -127,7 +188,7 @@ export function printStockSummary(
       </head>
 
       <body>
-        <h1>Résumé stock — Caz Food</h1>
+        <h1>Résumé stock — ${meta.restaurantName ?? 'FOODATOI'}</h1>
         <p class="meta">
           ${meta.rangeLabel ?? 'Toutes les commandes affichées'} ·
           généré le ${new Date().toLocaleString('fr-FR')}
@@ -223,7 +284,6 @@ export function subscribeToOrderChanges(client, callback, onStatusChange) {
         table: 'orders'
       },
       (payload) => {
-        console.log('[Realtime] Nouvelle commande reçue', payload);
         callback(payload);
       }
     )
@@ -235,7 +295,6 @@ export function subscribeToOrderChanges(client, callback, onStatusChange) {
         table: 'orders'
       },
       (payload) => {
-        console.log('[Realtime] Commande mise à jour', payload);
         callback(payload);
       }
     )
@@ -247,20 +306,13 @@ export function subscribeToOrderChanges(client, callback, onStatusChange) {
         table: 'orders'
       },
       (payload) => {
-        console.log('[Realtime] Commande supprimée', payload);
         callback(payload);
       }
     );
 
   channel.subscribe((status, error) => {
-    console.log('[Realtime] Statut:', status);
-
     if (error) {
       console.error('[Realtime] Erreur:', error);
-    }
-
-    if (status === 'SUBSCRIBED') {
-      console.log('[Realtime] Abonnement actif pour public.orders');
     }
 
     if (status === 'CHANNEL_ERROR') {
@@ -285,7 +337,8 @@ import { formatPickupTime } from './timeFormat.mjs';
 
 export function printOrder(
   order,
-  openWindow = (url = '', target = '_blank') => window.open(url, target)
+  openWindow = (url = '', target = '_blank') => window.open(url, target),
+  restaurantName = null
 ) {
   const win = openWindow('', '_blank');
 
@@ -385,9 +438,7 @@ export function printOrder(
 
       <body>
         <div class="center">
-          <strong>CAZ FOOD</strong>
-          <br>
-          CAZÈRES
+          <strong>${restaurantName ?? 'FOODATOI'}</strong>
           <br><br>
           ${order.order_number ?? order.number ?? '—'}
         </div>

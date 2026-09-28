@@ -2,6 +2,7 @@
 <html lang="fr">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co wss://*.supabase.co; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#171714" />
     <title>FOODATOI — Votre commande, votre marge</title>
@@ -9,6 +10,9 @@
       name="description"
       content="La plateforme de commande directe pour restaurateurs. Zéro commission cachée, vos données vous appartiennent, en ligne rapidement."
     />
+    <meta property="og:title" content="FOODATOI — Votre commande, votre marge" />
+    <meta property="og:description" content="La plateforme de commande directe pour restaurateurs. Zéro commission cachée, vos données vous appartiennent, en ligne rapidement." />
+    <meta property="og:type" content="website" />
     <style>
       @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
 
@@ -296,7 +300,7 @@
   <body>
     <header class="top">
       <div class="wordmark">FOOD<span>A</span>TOI</div>
-      <a class="cta-link" href="mailto:digitalagenceoccitane@gmail.com">
+      <a class="cta-link" href="mailto:foodatoi.contact@gmail.com">
         Nous contacter
       </a>
     </header>
@@ -313,7 +317,7 @@
           la main sur vos ventes à emporter — sans reverser une
           partie de chaque commande à une plateforme.
         </p>
-        <a class="primary-cta" href="mailto:digitalagenceoccitane@gmail.com">
+        <a class="primary-cta" href="mailto:foodatoi.contact@gmail.com">
           Nous contacter →
         </a>
       </section>
@@ -491,36 +495,16 @@
       <section class="closing wrap">
         <h2>Prêt à reprendre la main sur vos commandes ?</h2>
         <p>Parlons de votre restaurant.</p>
-        <a class="primary-cta" href="mailto:digitalagenceoccitane@gmail.com">
-          digitalagenceoccitane@gmail.com
+        <a class="primary-cta" href="mailto:foodatoi.contact@gmail.com">
+          foodatoi.contact@gmail.com
         </a>
       </section>
     </main>
 
     <footer class="bottom">
-      FOODATOI
+      FOODATOI · <a href="/legal.html">Mentions légales · CGU/CGV · Confidentialité</a>
     </footer>
 
-    <script>
-      document.querySelectorAll('.view-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          document.querySelectorAll('.view-btn').forEach(function (b) {
-            b.classList.remove('is-active');
-          });
-          btn.classList.add('is-active');
-
-          var view = btn.dataset.view;
-
-          document.getElementById('view-commercant').classList.toggle(
-            'hidden',
-            view !== 'commercant'
-          );
-          document.getElementById('view-technique').classList.toggle(
-            'hidden',
-            view !== 'technique'
-          );
-        });
-      });
-    </script>
+    <script type="module" src="/proView.js"></script>
   </body>
 </html>

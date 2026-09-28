@@ -5,7 +5,9 @@ import {
   printOrder,
   aggregateOrderItems,
   buildStockSummaryCsv,
-  calculateUberEatsSavings
+  calculateUberEatsSavings,
+  filterOrdersByDateRange,
+  buildAccountingCsv
 } from './adminFeatures.mjs';
 
 test('aggregateOrderItems groups identical product+options across orders and sums quantity/revenue', () => {
@@ -130,4 +132,64 @@ test('printOrder opens a print window with ticket markup', () => {
   printOrder(order, () => win);
   assert.match(opened, /CF-123/);
   assert.match(opened, /Tacos double/);
+});
+
+test('filterOrdersByDateRange keeps only orders within the inclusive range', () => {
+  const orders = [
+    { created_at: '2026-08-01T10:00:00Z' },
+    { created_at: '2026-08-15T10:00:00Z' },
+    { created_at: '2026-08-31T23:00:00Z' },
+    { created_at: '2026-09-01T00:00:00Z' }
+  ];
+
+  const result = filterOrdersByDateRange(orders, '2026-08-01', '2026-08-31');
+  assert.equal(result.length, 3);
+  assert.ok(!result.some((o) => o.created_at.startsWith('2026-09')));
+});
+
+test('filterOrdersByDateRange with no bounds returns everything unchanged', () => {
+  const orders = [{ created_at: '2026-08-01T10:00:00Z' }, { created_at: '2026-09-01T10:00:00Z' }];
+  assert.equal(filterOrdersByDateRange(orders, null, null).length, 2);
+});
+
+test('buildAccountingCsv produces one row per order with the expected columns', () => {
+  const orders = [
+    {
+      order_number: 'FA-260831-ABC123',
+      created_at: '2026-08-31T10:00:00Z',
+      pickup_time: '2026-08-31T12:00:00+00:00',
+      customer_name: 'Kevin Cardia',
+      customer_phone: '0600000000',
+      total_cents: 1890,
+      payment_status: 'PAY_AT_STORE',
+      status: 'READY'
+    }
+  ];
+
+  const csv = buildAccountingCsv(orders);
+  const lines = csv.split('\n');
+
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /Numéro de commande;Date;Heure de retrait/);
+  assert.match(lines[1], /FA-260831-ABC123/);
+  assert.match(lines[1], /Kevin Cardia/);
+  assert.match(lines[1], /18,90/);
+});
+
+test('buildAccountingCsv escapes values containing the CSV separator', () => {
+  const orders = [
+    {
+      order_number: 'FA-1',
+      created_at: '2026-08-31T10:00:00Z',
+      customer_name: 'Nom; avec point-virgule',
+      total_cents: 100
+    }
+  ];
+
+  const csv = buildAccountingCsv(orders);
+  assert.match(csv, /"Nom; avec point-virgule"/);
+});
+
+test('buildAccountingCsv handles an empty list', () => {
+  assert.equal(buildAccountingCsv([]), 'Numéro de commande;Date;Heure de retrait;Client;Téléphone;Montant TTC (€);Statut paiement;Statut commande');
 });
