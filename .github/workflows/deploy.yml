@@ -24,8 +24,35 @@ jobs:
       - name: Build
         run: npm run build
 
+  # Tests Postgres RÉELS du connecteur RusHour (RLS, trigger d'enqueue,
+  # concurrence FOR UPDATE SKIP LOCKED) sur une base jetable du runner -
+  # jamais sur le projet Supabase.
+  rushour-db-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: RusHour DB tests
+        run: npm run test:db:rushour
+        env:
+          RUSHOUR_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+
   deploy:
-    needs: test-and-build
+    needs: [test-and-build, rushour-db-tests]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
