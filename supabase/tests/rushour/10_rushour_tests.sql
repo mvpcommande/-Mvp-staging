@@ -157,13 +157,18 @@ begin
     raise notice 'ok - UNIQUE(restaurant_id, product_id)';
   end;
 
-  begin
-    update public.restaurant_rushour_connections set rushour_integration_id = 'itg-a'
-    where restaurant_id = '0b000000-0000-4000-8000-00000000000b';
-    raise exception 'FAIL - deux restaurants sur la même intégration';
-  exception when unique_violation then
-    raise notice 'ok - deux restaurants ne peuvent pas partager une intégration RusHour';
-  end;
+  -- Bloc 1.1 : la cardinalité integrationId <-> établissement n'est pas
+  -- confirmée par RusHour ; le schéma ne l'impose PAS (invariant externe
+  -- inconnu). Ce n'est pas une recommandation de configuration.
+  update public.restaurant_rushour_connections set rushour_integration_id = 'itg-a'
+  where restaurant_id = '0b000000-0000-4000-8000-00000000000b';
+  perform pg_temp.check((select count(*) from public.restaurant_rushour_connections where rushour_integration_id = 'itg-a') = 2,
+    'deux restaurants PEUVENT techniquement partager un integrationId (invariant externe non imposé)');
+  perform pg_temp.check(public.rushour_export_key('d0000000-0000-4000-8000-000000000001', 'itg-a')
+    <> public.rushour_export_key('d0000000-0000-4000-8000-000000000002', 'itg-a'),
+    'integrationId partagé : clés d''export toujours distinctes par commande');
+  update public.restaurant_rushour_connections set rushour_integration_id = 'itg-b'
+  where restaurant_id = '0b000000-0000-4000-8000-00000000000b';
 
   begin
     insert into public.rushour_order_outbox (restaurant_id, order_id, export_key, destination_integration_id)
@@ -386,5 +391,86 @@ do $$ begin
       <> public.rushour_export_key('d0000000-0000-4000-8000-000000000042', 'test-integration-b'),
     'clé d''export différente par destination');
 end $$;
+
+-- ---------------------------------------------------------------------------
+-- 7. Réconciliation automatique (Bloc 1.1) — DEGRADED PATH
+-- ---------------------------------------------------------------------------
+-- 7a. Scénario critique : trigger d'enqueue en échec -> commande conservée,
+--     pas d'outbox -> rushour_reconcile() -> exactement une entrée, deux fois.
+create trigger t_boom before insert on public.rushour_order_outbox for each row execute function pg_temp.boom();
+select pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000001', 2, 'degraded-key') \gset degraded_
+drop trigger t_boom on public.rushour_order_outbox;
+select set_config('rushour_test.degraded_order', :'degraded_t_order', false) \gset
+do $$
+declare v_order uuid := current_setting('rushour_test.degraded_order')::uuid; v_n int;
+begin
+  perform pg_temp.check(exists (select 1 from public.orders where id = v_order), 'degraded path : order EXISTS');
+  perform pg_temp.check(not exists (select 1 from public.rushour_order_outbox where order_id = v_order),
+    'degraded path : rushour_order_outbox DOES NOT EXIST');
+  perform pg_temp.check(exists (select 1 from public.rushour_sync_events where order_id = v_order and outcome = 'ENQUEUE_FAILED'),
+    'degraded path : ENQUEUE_FAILED journalisé');
+  v_n := public.rushour_reconcile();
+  perform pg_temp.check(v_n >= 1 and (select count(*) from public.rushour_order_outbox where order_id = v_order) = 1,
+    'réconciliation n°1 : outbox EXISTS EXACTLY ONCE');
+  perform pg_temp.check((select export_key from public.rushour_order_outbox where order_id = v_order)
+      = public.rushour_export_key(v_order, 'itg-a'), 'réconciliation : même clé d''export que le primary path');
+  perform pg_temp.check(public.rushour_reconcile() = 0
+      and (select count(*) from public.rushour_order_outbox where order_id = v_order) = 1,
+    'réconciliation n°2 : toujours EXACTLY ONE (idempotente)');
+  perform pg_temp.check(exists (select 1 from public.rushour_sync_events
+      where order_id = v_order and step = 'RECONCILE' and outcome = 'RECONCILED'), 'réconciliation observable (événement RECONCILE)');
+end $$;
+
+-- 7b. Intégration désactivée puis réactivée.
+do $$
+declare v_order uuid;
+begin
+  update public.restaurant_rushour_connections set enabled = false where restaurant_id = '0a000000-0000-4000-8000-00000000000a';
+  v_order := pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000003', 1, 'disabled-key');
+  perform pg_temp.check(exists (select 1 from public.orders where id = v_order)
+      and not exists (select 1 from public.rushour_order_outbox where order_id = v_order),
+    'intégration désactivée : commande créée, aucun export actif');
+  perform pg_temp.check(public.rushour_reconcile() = 0, 'désactivée : la réconciliation n''exporte rien');
+  update public.restaurant_rushour_connections set enabled = true where restaurant_id = '0a000000-0000-4000-8000-00000000000a';
+  perform public.rushour_reconcile();
+  perform pg_temp.check((select count(*) from public.rushour_order_outbox where order_id = v_order) = 1,
+    'réactivée + réconciliation : commande de la coupure récupérée, exactement une fois');
+  perform public.rushour_reconcile();
+  perform pg_temp.check((select count(*) from public.rushour_order_outbox where order_id = v_order) = 1,
+    'réactivée : pas de duplication');
+end $$;
+
+-- 7c. Première activation : pas de renvoi d'historique ; commandes terminées ignorées ; bornes.
+do $$
+declare v_old uuid; v_ready uuid;
+begin
+  select id into v_old from public.orders where restaurant_id = '0c000000-0000-4000-8000-00000000000c' limit 1;
+  insert into public.restaurant_rushour_connections (restaurant_id, rushour_integration_id, enabled)
+  values ('0c000000-0000-4000-8000-00000000000c', 'itg-c', true);
+  perform public.rushour_reconcile();
+  perform pg_temp.check(not exists (select 1 from public.rushour_order_outbox where order_id = v_old),
+    'première activation : les commandes antérieures (export_from) ne sont pas exportées');
+
+  create trigger t_boom before insert on public.rushour_order_outbox for each row execute function pg_temp.boom();
+  v_ready := pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000001', 1, 'ready-key');
+  drop trigger t_boom on public.rushour_order_outbox;
+  update public.orders set status = 'READY' where id = v_ready;
+  perform public.rushour_reconcile();
+  perform pg_temp.check(not exists (select 1 from public.rushour_order_outbox where order_id = v_ready),
+    'commande déjà READY : non réconciliée (pas de double préparation)');
+
+  begin perform public.rushour_reconcile(interval '30 days'); raise exception 'FAIL - lookback non borné';
+  exception when raise_exception then
+    if sqlerrm like 'FAIL%' then raise; end if;
+    raise notice 'ok - lookback borné à 7 jours';
+  end;
+end $$;
+
+set role anon;
+do $$ begin
+  begin perform public.rushour_reconcile(); raise exception 'FAIL - anon réconcilie';
+  exception when insufficient_privilege then raise notice 'ok - anon ne peut pas appeler rushour_reconcile'; end;
+end $$;
+reset role;
 
 \echo 'SQL tests: all assertions passed'

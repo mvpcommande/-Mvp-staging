@@ -37,8 +37,9 @@ echo "# schéma : stub Supabase + base Foodatoi minimale"
 echo "# create_order() de production (migration 20260922080200, telle quelle)"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260922080200_enforce_idempotency_key_uniqueness.sql" >/dev/null
 
-echo "# migration RusHour"
+echo "# migrations RusHour (Bloc 1 + Bloc 1.1)"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
 
 JS_KEY="$(cd "$ROOT" && node --input-type=module -e "
 import { computeExportKey } from './supabase/functions/_shared/rushour/idempotency.mjs';
@@ -131,7 +132,35 @@ else
   exit 1
 fi
 
-echo "# rollback"
+echo "# réconciliation concurrente : 6 exécutions simultanées sur 30 commandes sans outbox"
+"${PSQL[@]}" "$URL" >/dev/null <<'SQL'
+create function public.t_boom() returns trigger language plpgsql as $$ begin raise exception 'outage'; end $$;
+create trigger t_boom before insert on public.rushour_order_outbox for each row execute function public.t_boom();
+insert into public.orders (restaurant_id, order_number, total_cents, pickup_time)
+select '0a000000-0000-4000-8000-00000000000a', 'RECON-' || g, 100, now() + interval '1 hour'
+from generate_series(1, 30) g;
+drop trigger t_boom on public.rushour_order_outbox;
+drop function public.t_boom();
+SQL
+missing_before="$("${PSQL[@]}" -tA "$URL" -c "select count(*) from public.orders o where o.order_number like 'RECON-%'
+  and not exists (select 1 from public.rushour_order_outbox b where b.order_id = o.id)")"
+for _ in $(seq 1 6); do "${PSQL[@]}" -tA "$URL" -c "select public.rushour_reconcile()" >/dev/null & done
+wait
+"${PSQL[@]}" -tA "$URL" -c "select public.rushour_reconcile()" >/dev/null
+recon="$("${PSQL[@]}" -tA "$URL" -c "select count(*) || ' ' || count(distinct b.order_id) from public.rushour_order_outbox b
+  join public.orders o on o.id = b.order_id where o.order_number like 'RECON-%'")"
+read -r recon_rows recon_orders <<<"$recon"
+if [ "$missing_before" = "30" ] && [ "$recon_rows" = "30" ] && [ "$recon_orders" = "30" ]; then
+  echo "ok - 30 commandes sans outbox, 7 réconciliations (dont 6 concurrentes) : 30 entrées, aucune en double"
+else
+  echo "FAIL - réconciliation concurrente : avant=$missing_before lignes=$recon_rows commandes=$recon_orders" >&2
+  exit 1
+fi
+
+echo "# rollback (Bloc 1.1 puis Bloc 1)"
+"${PSQL[@]}" "$URL" -c "update public.restaurant_rushour_connections set rushour_integration_id = 'itg-' || left(restaurant_id::text, 8)" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/rollbacks/rollback_20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
+echo "ok - rollback Bloc 1.1 appliqué"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/rollbacks/rollback_20260928090000_rushour_connector_foundation.sql" >/dev/null
 left_over="$("${PSQL[@]}" -tA "$URL" -c "
   select count(*) from pg_class where relname like 'rushour%' or relname = 'restaurant_rushour_connections'")"
@@ -146,6 +175,7 @@ fi
 
 echo "# migration ré-appliquée après rollback"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" >/dev/null
-echo "ok - migration ré-applicable après rollback"
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
+echo "ok - migrations ré-applicables après rollback"
 
 echo "# ALL RUSHOUR DB TESTS PASSED"

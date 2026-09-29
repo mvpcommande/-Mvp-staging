@@ -7,7 +7,8 @@ Toute la logique vit dans `../_shared/rushour/` (ESM pur, testé par
 `npm test`) ; ce fichier n'est qu'un adaptateur HTTP → `runDispatchBatch`.
 
 ## Pré-requis
-Migration `20260928090000_rushour_connector_foundation.sql` appliquée sur le
+Migrations `20260928090000_rushour_connector_foundation.sql` puis
+`20260929090000_rushour_reconciliation_and_fixes.sql` appliquées sur le
 projet **staging** (jamais la prod dans ce bloc).
 
 ## Secrets (Dashboard → Edge Functions → Secrets)
@@ -15,7 +16,12 @@ projet **staging** (jamais la prod dans ce bloc).
 |---|---|---|
 | `RUSHOUR_DISPATCH_SECRET` | aléatoire, ≥ 32 caractères (`openssl rand -hex 32`) | oui |
 | `RUSHOUR_MODE` | `mock` | non (défaut `mock`) |
-| `RUSHOUR_MOCK_SCENARIO` | `success`, `http_500`, `timeout`… | non (défaut `success`) |
+| `RUSHOUR_MOCK_SCENARIO` | `success`, `http_500`, `timeout`… ou séquence `timeout,success` | non (défaut `success`) |
+| `RUSHOUR_MOCK_RETRY_AFTER_SECONDS` | `0..3600` (Retry-After du mock 429) | non |
+| `RUSHOUR_SEND_TIMEOUT_MS` | `500..15000` | non (défaut `10000`) |
+
+`RUSHOUR_APP_ID` / `RUSHOUR_APP_SECRET` ne sont **jamais lus** par cette
+version : même définis par erreur, le mode mock reste forcé.
 
 Aucun de ces noms n'est préfixé `VITE_` : ils n'existent que côté serveur.
 

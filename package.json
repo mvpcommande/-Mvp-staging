@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "node --test *.test.mjs supabase/functions/_shared/rushour/*.test.mjs",
     "test:e2e": "playwright test",
-    "test:db:rushour": "bash supabase/tests/rushour/run.sh"
+    "test:db:rushour": "bash supabase/tests/rushour/run.sh",
+    "test:e2e:rushour-local": "bash supabase/tests/rushour/e2e/run-e2e-local.sh"
   },
   "dependencies": {
     "@point-of-sale/receipt-printer-encoder": "3.0.3",

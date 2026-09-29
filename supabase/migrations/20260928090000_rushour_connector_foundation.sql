@@ -30,9 +30,12 @@
 --     produit (8 versions) : on n'y touche pas sans nécessité démontrée ;
 --   - le trigger capte TOUTE insertion de commande, quel que soit le
 --     canal (web aujourd'hui, WhatsApp demain via create_order()) ;
---   - il s'exécute dans la MÊME transaction que la commande (outbox
---     transactionnelle) : commande et entrée d'export sont validées ou
---     annulées ensemble, sans aucun appel réseau ;
+--   - il s'exécute dans la MÊME transaction que la commande, sans aucun
+--     appel réseau (PRIMARY PATH : commande + entrée d'export committées
+--     ensemble). ATTENTION (précision Bloc 1.1) : l'erreur d'enqueue étant
+--     absorbée (voir ci-dessous), l'outbox n'est PAS strictement atomique
+--     dans tous les cas -> DEGRADED PATH rattrapé par rushour_reconcile()
+--     (migration 20260929090000) ;
 --   - le chemin idempotent de create_order() (commande existante
 --     renvoyée) n'insère rien, donc n'enqueue rien : pas de double
 --     enqueue ; UNIQUE(order_id) le garantit de toute façon.

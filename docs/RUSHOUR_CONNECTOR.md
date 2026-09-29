@@ -1,9 +1,13 @@
-# Connecteur RusHour — Bloc 1 (fondation, mode mock)
+# Connecteur RusHour — Blocs 1 et 1.1 (mode mock)
 
-> **Statut : fondation livrée sur staging, en mode MOCK uniquement.**
+> **Statut : code prêt pour le staging, en mode MOCK uniquement.**
 > Aucun appel à l'API RusHour réelle n'est possible dans cette version
-> (double verrou : Edge Function `RUSHOUR_MODE=mock` + `RushourHttpClient`
-> qui refuse de s'instancier). Aucune migration n'a été appliquée.
+> (double verrou : `resolveRuntime()` n'accepte que `RUSHOUR_MODE=mock` et
+> ignore `RUSHOUR_APP_*`, et `RushourHttpClient` refuse de s'instancier).
+> **Aucune migration n'a été appliquée sur un projet Supabase** : le projet
+> staging `kkhlpeqherxfdnilewkp` n'est pas accessible avec les droits de
+> l'agent (voir §15). Le parcours complet a été validé sur une pile locale
+> équivalente (Postgres + PostgREST + Edge Function sous Deno).
 
 ## 1. Architecture
 
@@ -15,6 +19,9 @@ create_order()  ── RPC SECURITY DEFINER existante, NON modifiée
         │   (prix, total, horaires, rate-limit, idempotency checkout…)
         ▼
 orders ──(AFTER INSERT, même transaction)──► rushour_order_outbox (PENDING)
+   │                                                │
+   │  enqueue en échec (absorbé)                    │
+   └──► ENQUEUE_FAILED ──► rushour_reconcile() ─────┤  (pg_cron, toutes les 2 min)
                                                     │
                pg_cron + pg_net (chaque minute) ────┘  [à activer, §9]
                                                     ▼
@@ -44,7 +51,8 @@ atomiques) et une Edge Function Supabase suffisent.
    si le restaurant a une connexion RusHour **activée**, une ligne outbox
    `PENDING` est créée (`ON CONFLICT (order_id) DO NOTHING`). Toute erreur
    d'enqueue est capturée et journalisée (`ENQUEUE_FAILED`) : **la commande
-   passe toujours**.
+   passe toujours**, et la réconciliation automatique recrée l'entrée
+   (voir « Garantie réelle » ci-dessous).
 3. Le worker réclame un lot : `PENDING` échues → `SENDING`, `attempts+1`,
    `locked_by = workerId`, `locked_at = now()`.
 4. Pour chaque entrée : relecture de la config, contrôle que la destination
@@ -56,10 +64,58 @@ atomiques) et une Edge Function Supabase suffisent.
 
 Pourquoi un **trigger** plutôt qu'une modification de `create_order()` : la
 RPC est la pièce la plus durcie du produit (8 versions) ; le trigger capte
-toute insertion quel que soit le canal, vit dans la même transaction
-(outbox transactionnelle : commande et export sont validés ou annulés
-ensemble), ne fait aucun réseau, et le chemin idempotent de `create_order()`
-n'insérant rien, il n'enqueue rien. Détail : en-tête de la migration.
+toute insertion quel que soit le canal, s'exécute dans la transaction de la
+commande, ne fait aucun réseau, et le chemin idempotent de `create_order()`
+n'insérant rien, il n'enqueue rien.
+
+### Garantie réelle (correction de wording, Bloc 1.1)
+
+L'outbox n'est **pas** strictement atomique avec la commande dans tous les
+cas : le trigger absorbe volontairement toute erreur d'enqueue, parce
+qu'**une commande client ne doit jamais être refusée à cause du connecteur
+RusHour**.
+
+- **PRIMARY PATH** : `INSERT orders` → trigger → `INSERT outbox` → `COMMIT`
+  (commande et entrée d'export dans la même transaction ; un `ROLLBACK` de
+  la commande n'en laisse aucune).
+- **DEGRADED PATH** : `INSERT orders` → l'enqueue échoue → commande
+  **committée** → événement `ENQUEUE_FAILED` → `rushour_reconcile()` (job
+  serveur récurrent) → entrée outbox recréée, avec la même clé d'export.
+
+Formulation exacte : *transactional enqueue when possible + automatic
+reconciliation fallback*. Fenêtre d'exposition du degraded path : la
+période de la réconciliation (2 min en staging).
+
+### Réconciliation automatique
+
+`rushour_reconcile(p_lookback interval default '24 hours', p_limit int default 200)`,
+exécutée par pg_cron (`rushour-reconcile-staging`, toutes les 2 min, SQL
+pur, aucun réseau). Choix de pg_cron plutôt que d'un appel à l'Edge
+Function : c'est une opération purement base de données, elle doit tourner
+même si la fonction ou le réseau sont en panne, et pg_cron est déjà
+utilisé par Foodatoi. Aucun polling navigateur.
+
+Elle recrée l'entrée pour les commandes :
+- d'un restaurant dont la connexion est `enabled = true` ;
+- créées depuis `max(export_from, now() - lookback)` ;
+- encore en cours (`NEW`, `ACCEPTED`, `PREPARING`). Une commande déjà
+  `READY` ou `CANCELLED` a été traitée hors RusHour : la pousser en cuisine
+  après coup provoquerait une double préparation ;
+- sans aucune entrée outbox.
+
+Elle est idempotente (`ON CONFLICT (order_id) DO NOTHING` + `UNIQUE(order_id)`),
+bornée (lookback ≤ 7 jours, ≤ 1000 commandes par passage, aucune boucle),
+sérialisée (verrou consultatif : une exécution concurrente rend 0 sans
+attendre), observable (un événement `RECONCILE/RECONCILED` par entrée
+recréée) et tenant-safe (clé d'export identique au primary path).
+
+`export_from` (colonne de `restaurant_rushour_connections`) est la borne
+basse. Elle vaut l'instant de la **première** activation : activer un
+restaurant ne renvoie jamais son historique. Une désactivation puis
+réactivation la **conserve** : les commandes passées pendant la coupure
+(dans la fenêtre de lookback) sont rattrapées, exactement une fois.
+`rushour_enqueue_missing(p_since)` reste disponible comme alias manuel
+borné de la réconciliation.
 
 ## 3. Composants
 
@@ -90,10 +146,18 @@ l'identique par `node --test` et par Deno.
 ## 4. Modèle de données
 
 **`restaurant_rushour_connections`** — une ligne par restaurant :
-`restaurant_id` (PK/FK), `rushour_integration_id` (requis, format contrôlé,
-**unique** : deux restaurants ne peuvent pas router vers la même
-intégration), `rushour_store_id` (optionnel, UNKNOWN), `enabled` (défaut
-**false**), `created_at`, `updated_at`. **Aucun secret, jamais.**
+`restaurant_id` (PK/FK), `rushour_integration_id` (requis, format contrôlé),
+`rushour_store_id` (optionnel, UNKNOWN), `enabled` (défaut **false**),
+`export_from`, `created_at`, `updated_at`. **Aucun secret, jamais.**
+
+`rushour_integration_id` **n'est pas unique** (Bloc 1.1) : la cardinalité
+integrationId ↔ établissement n'est pas confirmée par RusHour, on
+n'impose donc pas en base un invariant externe inconnu. Deux restaurants
+peuvent aujourd'hui techniquement partager un identifiant (testé). Ce n'est
+pas une recommandation : une éventuelle unicité sera réintroduite après
+lecture de la documentation RusHour. L'isolation tenant ne dépend pas de
+cette contrainte (PK `restaurant_id`, FK composites, clé d'export par
+commande).
 
 **`rushour_product_mappings`** — PK `(restaurant_id, product_id)`, FK
 composite `(product_id, restaurant_id) → products(id, restaurant_id)` :
@@ -144,6 +208,11 @@ commande). Clé = `'fdt1_' || 32 hex de sha256('foodatoi-rushour-export:v1:'
 - `AUTH_ERROR` (401/403) : retry espacé d'au moins 10 min, borné.
 - `NON_RETRYABLE` (400, 404, 409, 422…), `MAPPING_ERROR`,
   `VALIDATION_ERROR` : `FAILED` immédiat.
+- **409 : TEMPORARY CONSERVATIVE BEHAVIOR.** Le 409 est traité comme
+  `NON_RETRYABLE` → revue humaine, uniquement parce que sa sémantique
+  RusHour est inconnue. Un 409 n'est **pas** considéré comme la preuve d'un
+  doublon (ni comme un succès). À revoir dès la lecture de la documentation
+  RusHour.
 - `UNKNOWN` (dont réponse 2xx illisible) : `FAILED` — la commande a *peut-être*
   été créée, un rejeu automatique risquerait un doublon en cuisine.
 - La base plafonne `attempts ≤ max_attempts` indépendamment du JS : aucune
@@ -193,8 +262,8 @@ fois ; un worker qui garde ses verrous n'est jamais doublé.
   `timeout_after_accept`, `network`, `invalid_response`. Aucun réseau
   (vérifié en neutralisant `fetch`).
 - Tests : voir [`RUSHOUR_TEST_PLAN.md`](./RUSHOUR_TEST_PLAN.md).
-- Rattrapage : `select rushour_enqueue_missing(now() - interval '1 hour');`
-  (borné à 7 jours).
+- Rattrapage : automatique (`rushour_reconcile`, pg_cron) ; manuel :
+  `select rushour_reconcile();` ou `select rushour_enqueue_missing(now() - interval '1 hour');`.
 - Requeue manuel : `select rushour_requeue('<order_id>');`
 - Supervision : `select status, count(*) from rushour_order_outbox group by 1;`
   et `rushour_sync_events` (FAILED, `ENQUEUE_FAILED`, `COMPLETION_UNCERTAIN`).
@@ -202,8 +271,10 @@ fois ; un worker qui garde ses verrous n'est jamais doublé.
 ### Application sur STAGING (manuelle, non faite)
 
 1. Vérifier **positivement** la cible : project ref `kkhlpeqherxfdnilewkp`
-   (staging). Jamais `ffuykessameuonpnyiyc` (production).
-2. Appliquer `20260928090000_rushour_connector_foundation.sql`
+   (staging). Jamais `ffuykessameuonpnyiyc` (production). Inspecter le vrai
+   schéma avant d'appliquer (voir §15 : dérive de schéma à contrôler).
+2. Appliquer, dans l'ordre, `20260928090000_rushour_connector_foundation.sql`
+   puis `20260929090000_rushour_reconciliation_and_fixes.sql`
    (SQL editor ou `supabase db push` après `supabase link --project-ref
    kkhlpeqherxfdnilewkp`).
 3. Déployer la fonction (voir `supabase/functions/rushour-dispatch-order/README.md`),
@@ -215,18 +286,13 @@ fois ; un worker qui garde ses verrous n'est jamais doublé.
    insert into rushour_product_mappings (restaurant_id, product_id, rushour_product_id)
    select restaurant_id, id, 'mock-' || left(id::text, 8) from products where restaurant_id = '<resto demo staging>';
    ```
-5. Ordonnancement (à décider ; exemple pg_cron + pg_net + Vault) :
-   ```sql
-   select vault.create_secret('<RUSHOUR_DISPATCH_SECRET>', 'rushour_dispatch_secret');
-   select cron.schedule('rushour-dispatch', '* * * * *', $$
-     select net.http_post(
-       url := 'https://kkhlpeqherxfdnilewkp.supabase.co/functions/v1/rushour-dispatch-order',
-       headers := jsonb_build_object('Content-Type', 'application/json',
-         'x-rushour-dispatch-secret',
-         (select decrypted_secret from vault.decrypted_secrets where name = 'rushour_dispatch_secret')),
-       body := '{"limit": 10}'::jsonb);
-   $$);
-   ```
+5. Ordonnancement : `supabase/ops/rushour_staging_schedule.sql` (script
+   d'exploitation, pas une migration) crée `rushour-reconcile-staging`
+   (toutes les 2 min) et `rushour-dispatch-staging` (chaque minute, pg_net
+   → Edge Function, secret lu dans Vault). Pré-requis : créer le secret
+   Vault `rushour_dispatch_secret` hors Git. Le script refuse de tourner si
+   `-v project_ref` n'est pas le staging. C'est un garde-fou déclaratif :
+   la cible réelle reste l'URL de connexion utilisée, à vérifier.
    En mode mock, les commandes du restaurant de test passent `SENT` avec
    un `external_order_id` préfixé `mock_` : c'est attendu en staging.
 
@@ -236,7 +302,9 @@ fois ; un worker qui garde ses verrous n'est jamais doublé.
 |---|---|---|
 | `RUSHOUR_DISPATCH_SECRET` | Secrets Edge Function + Vault | Bloc 1 (staging) |
 | `RUSHOUR_MODE` | Secrets Edge Function | Bloc 1 : `mock` |
-| `RUSHOUR_MOCK_SCENARIO` | Secrets Edge Function | Bloc 1 (tests staging) |
+| `RUSHOUR_MOCK_SCENARIO` | Secrets Edge Function | Bloc 1 (tests staging), ex. `timeout,success` |
+| `RUSHOUR_MOCK_RETRY_AFTER_SECONDS` | Secrets Edge Function | Bloc 1.1 (test 429) |
+| `RUSHOUR_SEND_TIMEOUT_MS` | Secrets Edge Function | Bloc 1.1 (500..15000, défaut 10000) |
 | `RUSHOUR_APP_ID` | Secrets Edge Function | Bloc 2 |
 | `RUSHOUR_APP_SECRET` | Secrets Edge Function | Bloc 2 |
 
@@ -320,3 +388,53 @@ documentation API finale lue.
   Le connecteur est prêt pour `payment_status` : `PENDING` retient l'export
   (sans consommer de tentative), `PAID` → `isPaid: true`, `PAY_AT_STORE` →
   `isPaid: false`. Aucune modification paiement dans ce bloc.
+
+## 15. Bloc 1.1 : validation d'intégration — état réel
+
+**Staging Supabase non identifié positivement.** Le connecteur Supabase de
+l'agent ne voit que deux projets : `-ProspectOS-staging` et
+`foodatoicontact's Project` (`vptqxhlxwiljfbkybqej`, dont le schéma est
+celui de ProspectOS : organizations, prospects…, aucune table Foodatoi).
+`kkhlpeqherxfdnilewkp` renvoie « permission denied ». Conformément à la
+règle, **rien n'a été appliqué ni déployé à distance**.
+
+À la place, le parcours complet est prouvé sur une **pile locale
+équivalente** (`supabase/tests/rushour/e2e/`) :
+
+- Postgres 16 avec la vraie `create_order()` de production (migration
+  `20260922080200` telle quelle) et les deux migrations RusHour ;
+- PostgREST 12, le même moteur REST que Supabase, avec des JWT anon,
+  authenticated et service_role ;
+- la **vraie Edge Function** `rushour-dispatch-order` exécutée par Deno
+  avec `--allow-net` limité à la pile locale et `--cached-only`, ce qui
+  rend tout appel externe impossible ;
+- les commandes créées par le **vrai module frontend** `supabaseStore.mjs`
+  (supabase-js, clé anon), jamais par `INSERT` direct.
+
+Les seules interventions SQL directes sont marquées `[TEST-ONLY]` dans le
+driver : avance du temps (`next_attempt_at`, `locked_at`), panne d'enqueue
+simulée, lectures d'assertion.
+
+Dérive de schéma : les tables `orders` et `products` d'origine ne sont
+dans aucune migration versionnée. La pile locale les reconstruit à partir
+des migrations suivantes et de `create_order()`. **Avant application sur le
+vrai staging, comparer** : `restaurants`, `products`, `orders`,
+`order_items`, `order_events`, et les fonctions `create_order`,
+`set_updated_at`, `is_restaurant_admin`, `current_restaurant_id`. Points
+critiques pour la migration : `orders.id` et `products.id` uuid (index
+uniques `(id, restaurant_id)`), `orders.payment_status`, `orders.status`,
+`orders.created_at`, existence de `set_updated_at()`.
+
+Démonstration de `timeout_after_accept` — ce qui est prouvé et ce qui ne
+l'est pas :
+- **prouvé** : Foodatoi rejoue avec la **même** clé d'export et le même
+  payload, ne crée ni seconde commande ni seconde outbox, et un mock qui
+  déduplique sur `externalId` ne crée qu'un seul export logique ;
+- **non prouvé (UNKNOWN)** : que le **vrai** RusHour déduplique sur
+  `id`/`externalId`. S'il ne le fait pas, un timeout ambigu suivi d'un
+  retry créerait deux commandes côté RusHour. C'est le premier point à
+  confirmer avec la documentation ou le support RusHour avant le Bloc 2.
+- l'état du mock vit dans l'isolate de la fonction (singleton par
+  configuration). Il persiste entre invocations sur la pile locale ; sur
+  Supabase, les isolates sont recyclés, donc c'est un confort de test et
+  non une garantie.

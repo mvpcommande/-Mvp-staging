@@ -4,11 +4,14 @@
 
 ```bash
 npm ci
-npm test                    # historiques (87) + RusHour (68), node --test
+npm test                    # historiques (87) + RusHour (73), node --test
 npm run build               # puis relancer npm test : contrôle du bundle dist/
 RUSHOUR_TEST_DATABASE_URL=postgresql://postgres@localhost:5432/postgres \
   npm run test:db:rushour   # Postgres LOCAL jetable (refuse toute URL distante)
 npm run test:e2e            # parcours réel sur le site staging (réseau requis)
+RUSHOUR_TEST_DATABASE_URL=postgresql://postgres@localhost:5432/postgres \
+POSTGREST_BIN=/chemin/postgrest DENO_BIN=/chemin/deno \
+  npm run test:e2e:rushour-local   # pile locale équivalente au staging (Bloc 1.1)
 ```
 
 CI (`.github/workflows/deploy.yml`) : `test-and-build` (npm test + build) et
@@ -91,3 +94,47 @@ RUSHOUR (mode mock, restaurant de test)
 
 Tous les tests automatisés verts, aucun test existant désactivé ou modifié,
 aucun appel RusHour réel, aucun secret dans le repo ni le bundle.
+
+## Bloc 1.1 — ajouts
+
+### Tests Postgres (`run.sh`, 89 assertions)
+
+- [ ] DEGRADED PATH : trigger d'enqueue en échec → order EXISTS, outbox DOES NOT EXIST, `ENQUEUE_FAILED`
+- [ ] `rushour_reconcile()` n°1 → outbox EXACTLY ONCE (même clé que le primary path) ; n°2 → toujours EXACTLY ONE ; événement `RECONCILE`
+- [ ] deux restaurants avec le même `integrationId` acceptés (invariant externe non imposé)
+- [ ] intégration désactivée → pas d'outbox, réconciliation inactive ; réactivée → récupérée une fois
+- [ ] première activation : pas de renvoi d'historique (`export_from`) ; commande `READY` non réconciliée ; lookback borné
+- [ ] anon ne peut pas appeler `rushour_reconcile`
+- [ ] 6 réconciliations concurrentes sur 30 commandes → 30 entrées, aucune en double
+- [ ] rollback Bloc 1.1 puis Bloc 1, ré-application des deux migrations
+
+### Tests Node ajoutés (`runtime.test.mjs`)
+
+- [ ] K. `RUSHOUR_MODE=mock` + `RUSHOUR_APP_ID/SECRET` présents → MockClient, zéro `fetch`
+- [ ] tout mode ≠ `mock` → 503 ; aucun chemin de code vers `api.rushour.io`
+- [ ] séquences de scénarios, timeout borné, Retry-After mock, secret du dispatcher
+
+### Parcours d'intégration locale (`e2e/`, 54 assertions)
+
+Pile : Postgres + PostgREST + vraie Edge Function (Deno, réseau limité à la
+pile) + module frontend `supabaseStore.mjs`.
+
+- [ ] accès : mauvais secret / JWT anon seul → 401
+- [ ] happy path (3 produits, quantités, options) : orders=1, items OK, PENDING → Edge Function → SENT, `mock_…`, événements, pas de doublon
+- [ ] idempotence checkout préservée
+- [ ] double dispatch ×3 → un seul export logique
+- [ ] timeout → retry (vraie attente 5 s) → SENT
+- [ ] timeout_after_accept → retry même clé → SENT, doublon signalé par le mock
+- [ ] HTTP 500 → retry → SENT ; HTTP 429 + Retry-After 90 s respecté → SENT
+- [ ] HTTP 400 → FAILED, 1 tentative ; HTTP 401 → retry 10 min → SENT
+- [ ] mapping manquant → FAILED → mapping → `rushour_requeue` → SENT
+- [ ] désactivé → réactivé → réconciliation (1 puis 0) → SENT
+- [ ] panne d'enqueue → réconciliation (1 puis 0) → SENT
+- [ ] concurrence : 3 invocations simultanées, 12 commandes → 12 SENT, attempts = 1
+- [ ] lease : worker mort → SENDING conservé → reprise après expiration → ancien worker bloqué
+- [ ] RLS via PostgREST : anon (SELECT/INSERT/UPDATE/RPC refusés), admin A ≠ B, non-admin sans accès
+
+### À exécuter sur le VRAI staging (non fait : projet inaccessible)
+
+Même checklist, après application des migrations et déploiement de la
+fonction, avec le restaurant de test staging.
