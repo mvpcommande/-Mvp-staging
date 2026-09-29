@@ -393,6 +393,15 @@ async function scenarios() {
   const custRpc = await customer.rpc('rushour_requeue', { p_order_id: bOrderNeighbour.id });
   check(!custRows.error && custRows.data.length === 0 && !!custRpc.error, 'RLS : authenticated non-admin ne voit rien et n’administre rien');
 
+  // --------------------------------- secret Vault (chemin du staging réel)
+  const vaultSecret = randomBytes(32).toString('hex');
+  sql(`insert into vault.secrets (name, secret) values ('rushour_dispatch_secret', '${vaultSecret}')`); // [TEST-ONLY]
+  await startFunction({ RUSHOUR_DISPATCH_SECRET: '' });
+  const vOrder = await placeOrder([item(P1, 1)]);
+  check((await invoke({ secret: 'f'.repeat(64) })).status === 401, 'Vault : sans secret d’environnement, mauvais secret -> 401');
+  const vOk = await invoke({ secret: vaultSecret });
+  check(vOk.status === 200 && outbox(vOrder.id).status === 'SENT', 'Vault : bon secret (vérifié par RPC) -> dispatch -> SENT');
+
   // --------------------------------------------------------------- bilan
   check(one(`select count(*) from public.rushour_order_outbox group by order_id having count(*) > 1`) === '',
     'global : aucune commande avec deux outbox');

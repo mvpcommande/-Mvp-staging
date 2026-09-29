@@ -40,6 +40,7 @@ echo "# create_order() de production (migration 20260922080200, telle quelle)"
 echo "# migrations RusHour (Bloc 1 + Bloc 1.1)"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" >/dev/null
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929100000_rushour_dispatch_secret_vault.sql" >/dev/null
 
 JS_KEY="$(cd "$ROOT" && node --input-type=module -e "
 import { computeExportKey } from './supabase/functions/_shared/rushour/idempotency.mjs';

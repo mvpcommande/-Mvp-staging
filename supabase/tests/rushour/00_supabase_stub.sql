@@ -43,3 +43,8 @@ create or replace function auth.uid() returns uuid language sql stable as $$
 $$;
 
 grant execute on function auth.jwt(), auth.uid() to anon, authenticated, service_role;
+
+-- Vault minimal (stub) : même forme de lecture que supabase_vault.
+create schema if not exists vault;
+create table if not exists vault.secrets (id uuid primary key default gen_random_uuid(), name text unique, secret text);
+create or replace view vault.decrypted_secrets as select id, name, secret as decrypted_secret from vault.secrets;

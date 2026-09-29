@@ -1,13 +1,10 @@
 # Connecteur RusHour — Blocs 1 et 1.1 (mode mock)
 
-> **Statut : code prêt pour le staging, en mode MOCK uniquement.**
+> **Statut : déployé et validé sur le STAGING (`kkhlpeqherxfdnilewkp`), en mode MOCK uniquement.**
 > Aucun appel à l'API RusHour réelle n'est possible dans cette version
 > (double verrou : `resolveRuntime()` n'accepte que `RUSHOUR_MODE=mock` et
 > ignore `RUSHOUR_APP_*`, et `RushourHttpClient` refuse de s'instancier).
-> **Aucune migration n'a été appliquée sur un projet Supabase** : le projet
-> staging `kkhlpeqherxfdnilewkp` n'est pas accessible avec les droits de
-> l'agent (voir §15). Le parcours complet a été validé sur une pile locale
-> équivalente (Postgres + PostgREST + Edge Function sous Deno).
+> Production (`ffuykessameuonpnyiyc`) : **non modifiée**.
 
 ## 1. Architecture
 
@@ -389,52 +386,102 @@ documentation API finale lue.
   (sans consommer de tentative), `PAID` → `isPaid: true`, `PAY_AT_STORE` →
   `isPaid: false`. Aucune modification paiement dans ce bloc.
 
-## 15. Bloc 1.1 : validation d'intégration — état réel
+## 15. Bloc 1.1 : validation sur le vrai staging
 
-**Staging Supabase non identifié positivement.** Le connecteur Supabase de
-l'agent ne voit que deux projets : `-ProspectOS-staging` et
-`foodatoicontact's Project` (`vptqxhlxwiljfbkybqej`, dont le schéma est
-celui de ProspectOS : organizations, prospects…, aucune table Foodatoi).
-`kkhlpeqherxfdnilewkp` renvoie « permission denied ». Conformément à la
-règle, **rien n'a été appliqué ni déployé à distance**.
+### Identification
 
-À la place, le parcours complet est prouvé sur une **pile locale
-équivalente** (`supabase/tests/rushour/e2e/`) :
+`kkhlpeqherxfdnilewkp` = projet « Mvp-test » (eu-central-1). Sa clé
+publishable est identique à celle de `.github/workflows/deploy.yml` du
+staging, et ce n'est pas `ffuykessameuonpnyiyc` (production). Le projet
+était en pause ; il a été réactivé.
 
-- Postgres 16 avec la vraie `create_order()` de production (migration
-  `20260922080200` telle quelle) et les deux migrations RusHour ;
-- PostgREST 12, le même moteur REST que Supabase, avec des JWT anon,
-  authenticated et service_role ;
-- la **vraie Edge Function** `rushour-dispatch-order` exécutée par Deno
-  avec `--allow-net` limité à la pile locale et `--cached-only`, ce qui
-  rend tout appel externe impossible ;
-- les commandes créées par le **vrai module frontend** `supabaseStore.mjs`
-  (supabase-js, clé anon), jamais par `INSERT` direct.
+### Dérive de schéma constatée et traitée
 
-Les seules interventions SQL directes sont marquées `[TEST-ONLY]` dans le
-driver : avance du temps (`next_attempt_at`, `locked_at`), panne d'enqueue
-simulée, lectures d'assertion.
+Le staging a été construit par ses propres migrations `*_e2e_staging` : 6
+tables, `create_order` en 2 surcharges anciennes (sans `p_payment_method`).
+Il n'avait pas `set_updated_at()`, `current_restaurant_id()` ni
+`is_restaurant_admin()`, dont dépend la migration RusHour.
+→ `supabase/ops/staging_align_tenant_helpers.sql` les crée avec
+**exactement** les définitions de production. Aucune migration existante
+n'a été modifiée. Un dry-run dans une transaction annulée (`ROLLBACK`) a
+été exécuté sur le vrai schéma avant toute écriture.
 
-Dérive de schéma : les tables `orders` et `products` d'origine ne sont
-dans aucune migration versionnée. La pile locale les reconstruit à partir
-des migrations suivantes et de `create_order()`. **Avant application sur le
-vrai staging, comparer** : `restaurants`, `products`, `orders`,
-`order_items`, `order_events`, et les fonctions `create_order`,
-`set_updated_at`, `is_restaurant_admin`, `current_restaurant_id`. Points
-critiques pour la migration : `orders.id` et `products.id` uuid (index
-uniques `(id, restaurant_id)`), `orders.payment_status`, `orders.status`,
-`orders.created_at`, existence de `set_updated_at()`.
+### Migrations appliquées sur le staging (dans l'ordre)
 
-Démonstration de `timeout_after_accept` — ce qui est prouvé et ce qui ne
-l'est pas :
-- **prouvé** : Foodatoi rejoue avec la **même** clé d'export et le même
-  payload, ne crée ni seconde commande ni seconde outbox, et un mock qui
-  déduplique sur `externalId` ne crée qu'un seul export logique ;
-- **non prouvé (UNKNOWN)** : que le **vrai** RusHour déduplique sur
-  `id`/`externalId`. S'il ne le fait pas, un timeout ambigu suivi d'un
-  retry créerait deux commandes côté RusHour. C'est le premier point à
-  confirmer avec la documentation ou le support RusHour avant le Bloc 2.
-- l'état du mock vit dans l'isolate de la fonction (singleton par
-  configuration). Il persiste entre invocations sur la pile locale ; sur
-  Supabase, les isolates sont recyclés, donc c'est un confort de test et
-  non une garantie.
+| Version staging | Nom | Source repo |
+|---|---|---|
+| `20260929065620` | `staging_align_tenant_helpers` | `supabase/ops/staging_align_tenant_helpers.sql` |
+| `20260929065741` | `rushour_connector_foundation` | `20260928090000_rushour_connector_foundation.sql` |
+| `20260929065819` | `rushour_reconciliation_and_fixes` | `20260929090000_rushour_reconciliation_and_fixes.sql` |
+| (v. suivante) | `rushour_dispatch_secret_vault` | `20260929100000_rushour_dispatch_secret_vault.sql` |
+| (v. suivante) | `enable_pg_net…` puis `move_pg_net_to_extensions_schema` | `pg_net` dans le schéma `extensions` |
+
+Supabase attribue ses propres numéros de version (horodatage
+d'application) ; le contenu SQL est celui des fichiers du repo, sans les
+commentaires.
+
+### Secret du dispatcher
+
+Le secret est généré **dans la base** (`extensions.gen_random_bytes(32)`),
+stocké dans Supabase Vault (`rushour_dispatch_secret`), et vérifié par
+l'Edge Function via `rushour_verify_dispatch_secret` (service_role
+uniquement). Il n'a jamais été affiché, copié ni committé. C'est la même
+source que lit pg_net/pg_cron. Script : `supabase/ops/rushour_dispatch_secret.sql`.
+
+### Edge Function
+
+`rushour-dispatch-order` v2, `verify_jwt=false` (authentification par
+secret), aucun `RUSHOUR_MODE` défini, donc `mock` par défaut. Le code
+déployé a été relu via l'API et comparé : **13/13 fichiers identiques au
+repo**. La v1 avait été déployée par erreur avec un fichier incomplet ;
+elle ne pouvait pas démarrer, n'a jamais été appelée, et a été remplacée
+quelques minutes plus tard.
+
+### Parcours validé sur le staging réel
+
+Restaurant de test `rushour-test-staging` (données fictives), connexion
+`mock-staging-integration` activée, 3 produits et 3 mappings
+`mock-rh-product-1..3`. Le restaurant `demo-charge`, utilisé par l'e2e
+Playwright, n'a pas été touché.
+
+1. `POST /rest/v1/rpc/create_order` via la **passerelle API Supabase**,
+   avec la clé publishable (mêmes en-têtes et même corps que
+   `supabaseStore.mjs`), émis depuis la base par pg_net car l'environnement
+   de l'agent n'a pas d'accès HTTPS au staging → HTTP 200,
+   `FA-260929-7ABFD9`, total serveur 3200 cts (3 lignes, 6 articles,
+   options).
+2. Trigger → outbox **PENDING**, 1 ligne, clé `fdt1_…` conforme.
+3. `POST /functions/v1/rushour-dispatch-order`, secret lu dans Vault →
+   HTTP 200 `{"mode":"mock","claimed":1,"sent":1}`.
+4. Outbox **SENT**, 1 tentative, `external_order_id = mock_…`, événement
+   `COMPLETE:SENT`.
+5. Deux dispatchs supplémentaires → `claimed: 0`, rien ne change.
+6. Mauvais secret → 401 ; anon `GET /rest/v1/rushour_order_outbox` → 401
+   (42501) ; anon `rpc/rushour_reconcile` → 401 (42501).
+
+Les scénarios d'échec (timeout, 429, 500, 400, 401, mapping manquant,
+désactivation, panne d'enqueue, concurrence, reprise de bail) sont
+prouvés sur la pile locale équivalente (`supabase/tests/rushour/e2e/`,
+56 assertions). Sur le staging, ils nécessitent de changer
+`RUSHOUR_MOCK_SCENARIO` dans les secrets de la fonction, ce que les outils
+de l'agent ne permettent pas (voir limites).
+
+### Pile locale équivalente (preuve des scénarios d'échec)
+
+- Postgres 16 avec la vraie `create_order()` de production et les
+  migrations RusHour ;
+- PostgREST 12 ;
+- la vraie Edge Function sous Deno, avec `--allow-net` limité à la pile ;
+- les commandes créées par le module frontend `supabaseStore.mjs`.
+
+Les seules interventions SQL directes sont marquées `[TEST-ONLY]`.
+
+### timeout_after_accept — prouvé / non prouvé
+
+- **prouvé** : même clé d'export et même payload au retry, ni seconde
+  commande ni seconde outbox, un seul export logique côté mock ;
+- **UNKNOWN** : la déduplication par le **vrai** RusHour sur
+  `id`/`externalId`. Sans elle, un timeout ambigu suivi d'un retry
+  créerait deux commandes RusHour. C'est le premier point à confirmer.
+- l'état du mock vit dans l'isolate (recyclé par Supabase) : c'est un
+  confort de test, pas une garantie.

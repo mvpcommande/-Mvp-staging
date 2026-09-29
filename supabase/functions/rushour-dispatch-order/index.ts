@@ -11,7 +11,8 @@
 //
 // Secrets (Supabase Dashboard -> Edge Functions -> Secrets, jamais dans le
 // repo, jamais préfixés VITE_) :
-//   RUSHOUR_DISPATCH_SECRET   secret partagé avec l'ordonnanceur (requis, >= 32 car.)
+//   RUSHOUR_DISPATCH_SECRET   secret partagé (optionnel) ; à défaut, secret Vault
+//                             'rushour_dispatch_secret' vérifié par RPC (recommandé)
 //   RUSHOUR_MODE              "mock" (seule valeur acceptée)
 //   RUSHOUR_MOCK_SCENARIO     scénario(s) mock, ex. "success" ou "timeout,success"
 //   RUSHOUR_SEND_TIMEOUT_MS   délai d'envoi (500..15000, défaut 10000)
@@ -20,7 +21,7 @@
 import { createClient } from "jsr:@supabase/supabase-js@2.57.0";
 import { runDispatchBatch } from "../_shared/rushour/dispatcher.mjs";
 import { createSupabaseOutboxRepository } from "../_shared/rushour/supabaseRepository.mjs";
-import { checkDispatchAuth, resolveRuntime, RuntimeConfigError } from "../_shared/rushour/runtime.mjs";
+import { authorizeDispatch, resolveRuntime, RuntimeConfigError } from "../_shared/rushour/runtime.mjs";
 
 const MAX_BATCH = 25;
 
@@ -36,7 +37,21 @@ const getEnv = (name: string) => Deno.env.get(name);
 Deno.serve(async (req: Request) => {
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
-  const denied = checkDispatchAuth(getEnv, req.headers.get("x-rushour-dispatch-secret"));
+  const db = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const denied = await authorizeDispatch({
+    getEnv,
+    providedSecret: req.headers.get("x-rushour-dispatch-secret"),
+    verifyWithDb: async (candidate: string) => {
+      const { data, error } = await db.rpc("rushour_verify_dispatch_secret", { p_candidate: candidate });
+      if (error) throw new Error("verify_failed");
+      return data;
+    },
+  });
   if (denied) return json({ error: denied.error }, denied.status);
 
   let runtime;
@@ -52,12 +67,6 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     if (Number.isInteger(body?.limit)) limit = Math.min(Math.max(body.limit, 1), MAX_BATCH);
   } catch (_e) { /* corps optionnel */ }
-
-  const db = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    { auth: { persistSession: false, autoRefreshToken: false } },
-  );
 
   const workerId = `edge:${crypto.randomUUID()}`;
   try {

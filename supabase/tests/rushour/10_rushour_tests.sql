@@ -473,4 +473,28 @@ do $$ begin
 end $$;
 reset role;
 
+-- ---------------------------------------------------------------------------
+-- 8. Secret du dispatcher dans Vault (Bloc 1.1)
+-- ---------------------------------------------------------------------------
+do $$ begin
+  perform pg_temp.check(public.rushour_verify_dispatch_secret('x') is null, 'Vault : secret absent -> NULL (fail closed)');
+  insert into vault.secrets (name, secret) values ('rushour_dispatch_secret', repeat('s', 64));
+  perform pg_temp.check(public.rushour_verify_dispatch_secret(repeat('s', 64)) = true, 'Vault : bon candidat -> TRUE');
+  perform pg_temp.check(public.rushour_verify_dispatch_secret(repeat('t', 64)) = false, 'Vault : mauvais candidat -> FALSE');
+  perform pg_temp.check(public.rushour_verify_dispatch_secret(null) = false, 'Vault : candidat NULL -> FALSE');
+  delete from vault.secrets where name = 'rushour_dispatch_secret';
+end $$;
+set role anon;
+do $$ begin
+  begin perform public.rushour_verify_dispatch_secret('x'); raise exception 'FAIL - anon vérifie le secret';
+  exception when insufficient_privilege then raise notice 'ok - anon ne peut pas interroger le secret du dispatcher'; end;
+end $$;
+reset role;
+set role authenticated;
+do $$ begin
+  begin perform public.rushour_verify_dispatch_secret('x'); raise exception 'FAIL - authenticated vérifie le secret';
+  exception when insufficient_privilege then raise notice 'ok - authenticated ne peut pas interroger le secret du dispatcher'; end;
+end $$;
+reset role;
+
 \echo 'SQL tests: all assertions passed'

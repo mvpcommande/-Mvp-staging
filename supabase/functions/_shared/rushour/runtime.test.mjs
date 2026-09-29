@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { resolveRuntime, checkDispatchAuth, safeEqual } from './runtime.mjs';
+import { resolveRuntime, checkDispatchAuth, safeEqual, authorizeDispatch } from './runtime.mjs';
 import { RushourMockClient } from './mockClient.mjs';
 import { runDispatchBatch } from './dispatcher.mjs';
 import { InMemoryOutbox } from './inMemoryOutbox.mjs';
@@ -79,4 +79,23 @@ test('authentification du dispatcher : secret requis, long, comparé à temps co
   assert.deepEqual(checkDispatchAuth(envOf({ RUSHOUR_DISPATCH_SECRET: good }), null), { error: 'unauthorized', status: 401 });
   assert.equal(checkDispatchAuth(envOf({ RUSHOUR_DISPATCH_SECRET: good }), good), null);
   assert.equal(safeEqual('abc', 'abcd'), false);
+});
+
+test('autorisation via Vault (RPC) quand aucun secret d’environnement', async () => {
+  const good = 'c'.repeat(64);
+  const verifyWithDb = async candidate => candidate === good;
+  const noEnv = envOf({});
+  assert.equal(await authorizeDispatch({ getEnv: noEnv, providedSecret: good, verifyWithDb }), null);
+  assert.deepEqual(await authorizeDispatch({ getEnv: noEnv, providedSecret: 'd'.repeat(64), verifyWithDb }),
+    { error: 'unauthorized', status: 401 });
+  assert.deepEqual(await authorizeDispatch({ getEnv: noEnv, providedSecret: 'short', verifyWithDb }),
+    { error: 'unauthorized', status: 401 }, 'secret trop court rejeté sans appel base');
+  assert.deepEqual(await authorizeDispatch({ getEnv: noEnv, providedSecret: good, verifyWithDb: async () => null }),
+    { error: 'dispatcher_not_configured', status: 503 }, 'Vault non configuré -> 503');
+  assert.deepEqual(await authorizeDispatch({ getEnv: noEnv, providedSecret: good, verifyWithDb: async () => { throw new Error('db'); } }),
+    { error: 'dispatcher_not_configured', status: 503 }, 'erreur base -> fail closed');
+  let called = false;
+  const envSecret = envOf({ RUSHOUR_DISPATCH_SECRET: 'e'.repeat(40) });
+  assert.equal(await authorizeDispatch({ getEnv: envSecret, providedSecret: 'e'.repeat(40), verifyWithDb: async () => { called = true; return false; } }), null);
+  assert.equal(called, false, 'secret d’environnement prioritaire, pas d’appel base');
 });

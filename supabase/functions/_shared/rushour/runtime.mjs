@@ -84,6 +84,38 @@ export function safeEqual(a, b) {
   return diff === 0;
 }
 
+/**
+ * Autorisation du dispatcher. Deux sources de vérité possibles :
+ * 1. RUSHOUR_DISPATCH_SECRET dans les secrets de l'Edge Function
+ *    (comparaison à temps constant) ;
+ * 2. à défaut, le secret Vault 'rushour_dispatch_secret' de la base,
+ *    vérifié par la RPC rushour_verify_dispatch_secret (service_role
+ *    uniquement, comparaison d'empreintes sha256). C'est la même source
+ *    que lit pg_cron/pg_net : un seul secret, jamais exposé.
+ *
+ * @param {{ getEnv: Function, providedSecret: string|null,
+ *           verifyWithDb: (candidate: string) => Promise<boolean|null> }} input
+ * @returns {Promise<null | { error: string, status: number }>}
+ */
+export async function authorizeDispatch({ getEnv, providedSecret, verifyWithDb }) {
+  const envSecret = getEnv('RUSHOUR_DISPATCH_SECRET');
+  if (envSecret !== undefined && envSecret !== null && envSecret !== '') {
+    return checkDispatchAuth(getEnv, providedSecret);
+  }
+  if (typeof providedSecret !== 'string' || providedSecret.length < MIN_DISPATCH_SECRET_LENGTH) {
+    return { error: 'unauthorized', status: 401 };
+  }
+  let verdict;
+  try {
+    verdict = await verifyWithDb(providedSecret);
+  } catch {
+    return { error: 'dispatcher_not_configured', status: 503 };
+  }
+  if (verdict === true) return null;
+  if (verdict === false) return { error: 'unauthorized', status: 401 };
+  return { error: 'dispatcher_not_configured', status: 503 };
+}
+
 /** Retourne null si autorisé, sinon { error, status }. */
 export function checkDispatchAuth(getEnv, providedSecret) {
   const expected = getEnv('RUSHOUR_DISPATCH_SECRET') ?? '';
