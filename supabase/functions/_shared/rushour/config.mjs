@@ -55,9 +55,18 @@ export function resolveRushourDestination(connection, restaurantId) {
       'Identifiant de store RusHour invalide');
   }
 
+  const targetEnvironment = connection.target_environment ?? 'test';
+  if (targetEnvironment !== 'test' && targetEnvironment !== 'production') {
+    throw new RushourError(ErrorCategory.NON_RETRYABLE, 'INVALID_TARGET_ENVIRONMENT',
+      'Environnement RusHour de destination invalide');
+  }
+
   return Object.freeze({
     restaurantId: restaurantId.toLowerCase(),
     integrationId: connection.rushour_integration_id,
-    storeId
+    storeId,
+    // Payment gate (Bloc 2) : true => seules les commandes PAID partent.
+    paymentRequired: connection.payment_required === true,
+    targetEnvironment
   });
 }

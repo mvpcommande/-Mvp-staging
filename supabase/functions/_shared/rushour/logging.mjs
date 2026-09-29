@@ -62,7 +62,7 @@ export function redact(value, depth = 0) {
  * et d'une éventuelle RushourError. Liste blanche de champs : rien
  * d'autre ne peut fuiter.
  */
-export function buildSyncEvent({ entry, step, outcome, error = null, message = null }) {
+export function buildSyncEvent({ entry, step, outcome, error = null, message = null, durationMs = null, endpoint = null }) {
   return {
     outbox_id: entry?.id ?? null,
     restaurant_id: entry?.restaurantId ?? null,
@@ -73,6 +73,8 @@ export function buildSyncEvent({ entry, step, outcome, error = null, message = n
     error_category: error?.category ?? null,
     error_code: error?.code ?? null,
     http_status: error?.httpStatus ?? null,
-    message: message !== null ? redactString(message) : error ? redactString(error.message) : null
+    message: message !== null ? redactString(message) : error ? redactString(error.message) : null,
+    duration_ms: Number.isFinite(durationMs) ? Math.max(0, Math.round(durationMs)) : null,
+    endpoint
   };
 }

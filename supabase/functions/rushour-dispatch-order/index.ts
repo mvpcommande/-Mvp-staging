@@ -1,9 +1,11 @@
-// rushour-dispatch-order : worker de l'outbox RusHour (Bloc RusHour 1 / 1.1).
+// rushour-dispatch-order : worker de l'outbox RusHour (Blocs RusHour 1 / 1.1 / 2).
 //
-// MODE MOCK UNIQUEMENT. Aucun appel à l'API RusHour réelle n'est possible
-// depuis cette version : resolveRuntime() n'accepte que RUSHOUR_MODE=mock,
-// renvoie toujours le RushourMockClient et ne lit jamais RUSHOUR_APP_ID /
-// RUSHOUR_APP_SECRET, même s'ils sont définis par erreur.
+// MODES (voir _shared/rushour/runtime.mjs) :
+//   mock (défaut) : RushourMockClient, zéro réseau ;
+//   live          : RushourHttpClient, UNIQUEMENT sur le projet staging, avec
+//                   profil d'API RusHour vérifié, credentials serveur présents
+//                   et destinations target_environment='test'. Au Bloc 2 le
+//                   profil n'est PAS vérifié : live répond 503 (fail closed).
 //
 // Appel : POST, uniquement par un ordonnanceur serveur (pg_cron + pg_net)
 // portant l'en-tête x-rushour-dispatch-secret. Jamais par le navigateur :
@@ -13,7 +15,8 @@
 // repo, jamais préfixés VITE_) :
 //   RUSHOUR_DISPATCH_SECRET   secret partagé (optionnel) ; à défaut, secret Vault
 //                             'rushour_dispatch_secret' vérifié par RPC (recommandé)
-//   RUSHOUR_MODE              "mock" (seule valeur acceptée)
+//   RUSHOUR_MODE              "mock" (défaut) | "live" (verrouillé, voir ci-dessus)
+//   RUSHOUR_APP_ID / RUSHOUR_APP_SECRET   live uniquement (lus par runtime.mjs)
 //   RUSHOUR_MOCK_SCENARIO     scénario(s) mock, ex. "success" ou "timeout,success"
 //   RUSHOUR_SEND_TIMEOUT_MS   délai d'envoi (500..15000, défaut 10000)
 // SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sont injectés par Supabase.

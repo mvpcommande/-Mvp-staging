@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { classifyHttpStatus, toRushourError, parseRetryAfter, ErrorCategory, RushourError } from './errors.mjs';
 import { decideRetry, DEFAULT_RETRY_POLICY } from './retryPolicy.mjs';
 import { RushourMockClient, MOCK_SCENARIOS } from './mockClient.mjs';
-import { validateSendResult, RushourHttpClient } from './client.mjs';
+import { validateSendResult } from './client.mjs';
+import { RushourHttpClient } from './httpClient.mjs';
+import { RUSHOUR_API_PROFILE } from './apiProfile.mjs';
 
 test('classification HTTP -> catégorie', () => {
   const cases = [
@@ -110,6 +112,9 @@ test('contrat client : réponses invalides rejetées', () => {
   }
 });
 
-test('client HTTP réel : désactivé tant que le schéma RusHour n’est pas vérifié', () => {
+test('client HTTP réel : désactivé tant que le profil d’API RusHour n’est pas vérifié', () => {
+  assert.equal(RUSHOUR_API_PROFILE.verified, false);
   assert.throws(() => new RushourHttpClient(), { code: 'REAL_CLIENT_DISABLED' });
+  assert.throws(() => new RushourHttpClient({ profile: RUSHOUR_API_PROFILE, appId: 'a', appSecret: 's' }),
+    { code: 'REAL_CLIENT_DISABLED' });
 });

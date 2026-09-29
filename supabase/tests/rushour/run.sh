@@ -41,6 +41,7 @@ echo "# migrations RusHour (Bloc 1 + Bloc 1.1)"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" >/dev/null
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929100000_rushour_dispatch_secret_vault.sql" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260930090000_rushour_bloc2_payment_gate_uncertain.sql" >/dev/null
 
 JS_KEY="$(cd "$ROOT" && node --input-type=module -e "
 import { computeExportKey } from './supabase/functions/_shared/rushour/idempotency.mjs';
@@ -158,7 +159,9 @@ else
   exit 1
 fi
 
-echo "# rollback (Bloc 1.1 puis Bloc 1)"
+echo "# rollback (Bloc 2, Bloc 1.1 puis Bloc 1)"
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/rollbacks/rollback_20260930090000_rushour_bloc2_payment_gate_uncertain.sql" >/dev/null
+echo "ok - rollback Bloc 2 appliqué"
 "${PSQL[@]}" "$URL" -c "update public.restaurant_rushour_connections set rushour_integration_id = 'itg-' || left(restaurant_id::text, 8)" >/dev/null
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/rollbacks/rollback_20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
 echo "ok - rollback Bloc 1.1 appliqué"
@@ -177,6 +180,8 @@ fi
 echo "# migration ré-appliquée après rollback"
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" >/dev/null
 "${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260929100000_rushour_dispatch_secret_vault.sql" >/dev/null
+"${PSQL[@]}" "$URL" -f "$ROOT/supabase/migrations/20260930090000_rushour_bloc2_payment_gate_uncertain.sql" >/dev/null
 echo "ok - migrations ré-applicables après rollback"
 
 echo "# ALL RUSHOUR DB TESTS PASSED"

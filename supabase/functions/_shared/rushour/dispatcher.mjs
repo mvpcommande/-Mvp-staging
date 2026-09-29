@@ -26,11 +26,24 @@ import { normalizeFoodatoiOrder } from './types.mjs';
 import { resolveRushourDestination } from './config.mjs';
 import { computeExportKey } from './idempotency.mjs';
 import { foodatoiOrderToRushour } from './mapper.mjs';
-import { assertRushourClient } from './client.mjs';
+import { assertRushourClient, clientGuaranteesIdempotency } from './client.mjs';
 import { decideRetry, DEFAULT_RETRY_POLICY } from './retryPolicy.mjs';
 import { SYNC_STEP, buildSyncEvent, redactString } from './logging.mjs';
 
 export const DEFAULT_SEND_TIMEOUT_MS = 10_000;
+
+export const SEND_ENDPOINT = 'orders.create';
+
+/**
+ * PAYMENT GATE (liste blanche, fail closed) — défense en profondeur de
+ * rushour_claim_outbox() : PAID toujours ; PAY_AT_STORE seulement si la
+ * connexion n'exige pas le paiement ; tout autre statut (PENDING, FAILED,
+ * inconnu) bloque l'export.
+ */
+export function isPaymentEligible(paymentStatus, paymentRequired) {
+  if (paymentStatus === 'PAID') return true;
+  return paymentStatus === 'PAY_AT_STORE' && paymentRequired !== true;
+}
 
 export const DISPATCH_OUTCOME = Object.freeze({
   SENT: 'SENT',
@@ -55,10 +68,16 @@ async function safeLog(repo, event) {
 async function sendWithTimeout(client, request, timeoutMs) {
   const controller = new AbortController();
   let timer;
+  // Le délai est dépassé APRÈS l'appel client : la commande a peut-être été
+  // créée. Sans idempotence garantie, c'est une incertitude, pas un retry.
+  const deadlineError = clientGuaranteesIdempotency(client)
+    ? new RushourError(ErrorCategory.TIMEOUT, 'TIMEOUT', `Pas de réponse RusHour en ${timeoutMs} ms`)
+    : new RushourError(ErrorCategory.UNCERTAIN, 'DISPATCH_DEADLINE_AMBIGUOUS',
+      `Pas de réponse RusHour en ${timeoutMs} ms : existence côté RusHour à vérifier`);
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
-      reject(new RushourError(ErrorCategory.TIMEOUT, 'TIMEOUT', `Pas de réponse RusHour en ${timeoutMs} ms`));
+      reject(deadlineError);
     }, timeoutMs);
   });
   try {
@@ -81,6 +100,8 @@ export async function dispatchOutboxEntry(entry, deps) {
 
   let step = SYNC_STEP.RESOLVE_CONFIG;
   let result;
+  let sendStartedAt = null;
+  const elapsed = () => (sendStartedAt === null ? null : Date.now() - sendStartedAt);
 
   try {
     const ctx = await repo.loadExportContext(entry);
@@ -99,6 +120,11 @@ export async function dispatchOutboxEntry(entry, deps) {
         'Intégration RusHour modifiée depuis la mise en file');
     }
 
+    if (!isPaymentEligible(ctx.order.payment_status, destination.paymentRequired)) {
+      throw new RushourError(ErrorCategory.NON_RETRYABLE, 'PAYMENT_NOT_ELIGIBLE',
+        'Paiement non confirmé : export RusHour interdit');
+    }
+
     const exportKey = await computeExportKey({ orderId: entry.orderId, integrationId: destination.integrationId });
     if (exportKey !== entry.exportKey) {
       throw validationError('EXPORT_KEY_MISMATCH', 'Clé d’export incohérente avec la commande');
@@ -111,6 +137,7 @@ export async function dispatchOutboxEntry(entry, deps) {
     });
 
     step = SYNC_STEP.SEND;
+    sendStartedAt = Date.now();
     result = await sendWithTimeout(client, { destination, payload, exportKey }, timeoutMs);
   } catch (raw) {
     const error = toRushourError(raw);
@@ -120,6 +147,17 @@ export async function dispatchOutboxEntry(entry, deps) {
       maxAttempts: entry.maxAttempts,
       retryAfterMs: error.retryAfterMs
     }, policy);
+    const durationMs = elapsed();
+    const endpoint = step === SYNC_STEP.SEND ? SEND_ENDPOINT : null;
+
+    if (decision.action === 'UNCERTAIN') {
+      const uncertainStatus = await repo.markUncertain({
+        id: entry.id, workerId, errorCode: error.code, errorMessage: redactString(error.message)
+      });
+      const outcome = uncertainStatus === 'UNCERTAIN' ? DISPATCH_OUTCOME.COMPLETION_UNCERTAIN : DISPATCH_OUTCOME.LEASE_LOST;
+      await safeLog(repo, buildSyncEvent({ entry, step, outcome, error, durationMs, endpoint }));
+      return { outcome, error, decision };
+    }
 
     const status = await repo.markFailed({
       id: entry.id,
@@ -134,7 +172,7 @@ export async function dispatchOutboxEntry(entry, deps) {
       ? DISPATCH_OUTCOME.RETRY_SCHEDULED
       : status === 'FAILED' ? DISPATCH_OUTCOME.FAILED : DISPATCH_OUTCOME.LEASE_LOST;
 
-    await safeLog(repo, buildSyncEvent({ entry, step, outcome, error }));
+    await safeLog(repo, buildSyncEvent({ entry, step, outcome, error, durationMs, endpoint }));
     return { outcome, error, decision };
   }
 
@@ -147,7 +185,8 @@ export async function dispatchOutboxEntry(entry, deps) {
     const marked = await repo.markSent({ id: entry.id, workerId, externalOrderId: result.externalOrderId });
     const outcome = marked ? DISPATCH_OUTCOME.SENT : DISPATCH_OUTCOME.LEASE_LOST;
     await safeLog(repo, buildSyncEvent({
-      entry, step, outcome, message: result.duplicate ? 'RusHour signale un doublon : export déjà présent' : null
+      entry, step, outcome, message: result.duplicate ? 'RusHour signale un doublon : export déjà présent' : null,
+      durationMs: elapsed(), endpoint: SEND_ENDPOINT
     }));
     return { outcome, externalOrderId: result.externalOrderId, duplicate: result.duplicate };
   } catch (raw) {
@@ -167,7 +206,9 @@ export async function runDispatchBatch({
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
     throw new RangeError('limit doit être compris entre 1 et 100');
   }
-  const entries = await repo.claim({ workerId, limit });
+  // Reprise d'un bail expiré (worker mort pendant l'envoi) : seulement si le
+  // client garantit l'idempotence ; sinon l'entrée passe UNCERTAIN en base.
+  const entries = await repo.claim({ workerId, limit, reclaimStale: clientGuaranteesIdempotency(client) });
   const summary = { claimed: entries.length, sent: 0, retryScheduled: 0, failed: 0, leaseLost: 0, uncertain: 0 };
 
   for (const entry of entries) {

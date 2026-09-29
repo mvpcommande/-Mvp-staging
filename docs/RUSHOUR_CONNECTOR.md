@@ -485,3 +485,44 @@ Les seules interventions SQL directes sont marquées `[TEST-ONLY]`.
   créerait deux commandes RusHour. C'est le premier point à confirmer.
 - l'état du mock vit dans l'isolate (recyclé par Supabase) : c'est un
   confort de test, pas une garantie.
+
+## 16. Bloc 2 : client HTTP réel (préparé, live verrouillé)
+
+- **`RushourHttpClient`** (`httpClient.mjs`) : token d'intégration côté
+  serveur, avec cache mémoire par intégration, marge avant expiration et
+  requête unique partagée entre appels simultanés. Timeout explicite sur
+  chaque requête. Classification HTTP. Un seul renouvellement de token sur
+  401, et seulement si le profil l'autorise. Validation du corps de réponse.
+  Aucun secret ni corps de réponse dans les erreurs.
+- **`apiProfile.mjs`** : seul endroit où vivent les valeurs dépendant de
+  RusHour. `verified: false` → client réel désactivé. Détail des 20 points :
+  [`RUSHOUR_API_VERIFIED.md`](./RUSHOUR_API_VERIFIED.md).
+- **Mode `live`** (`runtime.mjs`), accepté seulement si tous ces verrous sont
+  levés ; sinon 503, sans aucun réseau :
+  1. projet `kkhlpeqherxfdnilewkp` uniquement ; `ffuykessameuonpnyiyc`
+     explicitement refusé ;
+  2. profil d'API **et** schéma de payload vérifiés ;
+  3. `RUSHOUR_APP_ID` et `RUSHOUR_APP_SECRET` présents dans les secrets de
+     la fonction ;
+  4. destinations `target_environment = 'test'` uniquement.
+
+  Le mode par défaut reste `mock`.
+- **Statut `UNCERTAIN`** (migration `20260930090000`). Tant que la
+  déduplication RusHour n'est pas confirmée, les cas suivants mènent à
+  `UNCERTAIN`, jamais réclamé à nouveau :
+  - timeout après POST ;
+  - coupure réseau pendant l'envoi ;
+  - réponse 2xx illisible ;
+  - délai du dispatcher dépassé ;
+  - bail expiré en live.
+
+  Résolution humaine après vérification côté RusHour :
+  `rushour_resolve_uncertain(order_id, exists_in_rushour, external_id)`.
+- **Payment gate configurable** : voir
+  [`PAYMENT_GATE_RUSHOUR.md`](./PAYMENT_GATE_RUSHOUR.md).
+- **Observabilité** : `duration_ms` et `endpoint` sur `rushour_sync_events` ;
+  vue `rushour_dispatch_metrics`, qui expose les compteurs `success`,
+  `failed`, `retry`, `uncertain`, `auth_error`, `mapping_error` et la durée
+  moyenne, avec la RLS appliquée.
+- **Webhooks RusHour** : non implémentés. La signature n'est pas documentée,
+  donc aucun endpoint entrant ne peut être sécurisé.

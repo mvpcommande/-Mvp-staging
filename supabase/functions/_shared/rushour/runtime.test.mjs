@@ -38,23 +38,53 @@ test('K. mode mock + RUSHOUR_APP_ID/SECRET présents : MockClient, zéro fetch',
   }
 });
 
-test('K. mode par défaut = mock ; tout autre mode est refusé (503)', () => {
+test('K. mode par défaut = mock ; mode inconnu refusé (503)', () => {
   assert.equal(resolveRuntime(envOf({})).mode, 'mock');
-  for (const mode of ['live', 'real', 'http', 'MOCK', '']) {
+  for (const mode of ['real', 'http', 'MOCK', 'LIVE', '']) {
     assert.throws(() => resolveRuntime(envOf({ RUSHOUR_MODE: mode, RUSHOUR_APP_SECRET: 'x' })),
-      err => err.code === 'real_mode_not_available' && err.status === 503, mode);
+      err => err.code === 'unsupported_mode' && err.status === 503, mode);
   }
 });
 
-test('K. aucun chemin de code runtime/Edge Function vers l’API RusHour', () => {
+test('K. aucun chemin réseau hors du client HTTP (dispatcher, mock, Edge Function)', () => {
   const sources = [
-    readFileSync(new URL('./runtime.mjs', import.meta.url), 'utf8'),
     readFileSync(new URL('../../rushour-dispatch-order/index.ts', import.meta.url), 'utf8'),
     readFileSync(new URL('./dispatcher.mjs', import.meta.url), 'utf8'),
     readFileSync(new URL('./mockClient.mjs', import.meta.url), 'utf8')
   ].join('\n');
   assert.doesNotMatch(sources, /api\.rushour\.io|RushourHttpClient\(|fetch\(/);
-  assert.doesNotMatch(sources, /Deno\.env\.get\(["']RUSHOUR_APP/);
+  assert.doesNotMatch(sources, /Deno\.env\.get\(["']RUSHOUR_APP/, 'credentials lus uniquement via runtime.mjs');
+});
+
+const STAGING_URL = 'https://kkhlpeqherxfdnilewkp.supabase.co';
+const PROD_URL = 'https://ffuykessameuonpnyiyc.supabase.co';
+const VERIFIED_TEST_PROFILE = Object.freeze({
+  id: 'test-profile', verified: true, baseUrl: 'https://rushour.example.test',
+  token: { path: '/t/{appId}/{integrationId}', body: {}, accessTokenField: 'access_token',
+    expiresInField: 'expires_in', tokenTypeField: 'token_type', expectedTokenType: 'Bearer' },
+  order: { path: '/o/{appId}/{integrationId}', externalIdField: null },
+  dedupOnExternalId: false, refreshTokenOn401: false, tokenSafetyMarginSeconds: 60
+});
+const liveEnv = extra => envOf({ RUSHOUR_MODE: 'live', SUPABASE_URL: STAGING_URL,
+  RUSHOUR_APP_ID: 'app-test', RUSHOUR_APP_SECRET: FAKE_SECRETS.appSecret, ...extra });
+
+test('Bloc 2 : live IMPOSSIBLE avec les profils committés (non vérifiés), même credentials présents', () => {
+  assert.throws(() => resolveRuntime(liveEnv({})), err => err.code === 'live_profile_unverified' && err.status === 503);
+});
+
+test('Bloc 2 : live refusé hors staging, et explicitement sur la production', () => {
+  const ok = { profile: VERIFIED_TEST_PROFILE, payloadSchema: { verified: true }, fetchImpl: () => { throw new Error('no'); } };
+  assert.throws(() => resolveRuntime(liveEnv({ SUPABASE_URL: PROD_URL }), ok), { code: 'live_forbidden_on_production' });
+  assert.throws(() => resolveRuntime(liveEnv({ SUPABASE_URL: 'http://127.0.0.1:54321' }), ok), { code: 'live_project_not_allowed' });
+  assert.throws(() => resolveRuntime(liveEnv({ SUPABASE_URL: 'https://autreprojet.supabase.co' }), ok), { code: 'live_project_not_allowed' });
+  assert.throws(() => resolveRuntime(liveEnv({ RUSHOUR_APP_SECRET: '' }), ok), { code: 'live_credentials_missing' });
+  assert.throws(() => resolveRuntime(liveEnv({}), { ...ok, payloadSchema: { verified: false } }), { code: 'live_profile_unverified' });
+  const runtime = resolveRuntime(liveEnv({}), ok);
+  assert.equal(runtime.mode, 'live');
+  assert.equal(runtime.client.idempotencyGuaranteed, false);
+  const serialized = JSON.stringify(runtime.client);
+  assert.ok(!serialized.includes(FAKE_SECRETS.appSecret) && !serialized.includes('app-test'),
+    'client non sérialisable avec ses secrets');
 });
 
 test('scénarios mock : séquence, validation, timeout borné, instance partagée par configuration', () => {

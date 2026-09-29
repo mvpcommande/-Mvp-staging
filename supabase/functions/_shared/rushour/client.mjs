@@ -47,26 +47,13 @@ export function assertRushourClient(client) {
 }
 
 /**
- * Client HTTP réel - VOLONTAIREMENT NON IMPLÉMENTÉ dans ce bloc.
- *
- * Il refuse de s'instancier tant que le schéma de payload n'a pas été
- * vérifié contre la documentation officielle (RUSHOUR_PAYLOAD_SCHEMA).
- * Procédure de mise en service : docs/RUSHOUR_CONNECTOR.md § "Passage
- * mock -> RusHour réel".
+ * Un client ne garantit l'idempotence que s'il le déclare EXPLICITEMENT
+ * (mock : oui par construction ; HTTP : seulement si RusHour la documente).
+ * Sans déclaration, tout envoi ambigu est traité comme UNCERTAIN.
  */
-export class RushourHttpClient {
-  constructor() {
-    if (!RUSHOUR_PAYLOAD_SCHEMA.verified) {
-      throw new RushourError(ErrorCategory.NON_RETRYABLE, 'REAL_CLIENT_DISABLED',
-        'Client RusHour réel désactivé : schéma non vérifié (Bloc 2)');
-    }
-    throw new RushourError(ErrorCategory.NON_RETRYABLE, 'REAL_CLIENT_NOT_IMPLEMENTED',
-      'Client RusHour réel non implémenté (Bloc 2)');
-  }
+export const clientGuaranteesIdempotency = client => client?.idempotencyGuaranteed === true;
 
-  // eslint-disable-next-line class-methods-use-this
-  async sendOrder() {
-    throw new RushourError(ErrorCategory.NON_RETRYABLE, 'REAL_CLIENT_NOT_IMPLEMENTED',
-      'Client RusHour réel non implémenté (Bloc 2)');
-  }
-}
+// Le client HTTP réel est dans httpClient.mjs (RushourHttpClient). Il
+// refuse de s'instancier tant que le profil d'API (apiProfile.mjs) n'est pas
+// vérifié ; le runtime exige en plus RUSHOUR_PAYLOAD_SCHEMA.verified.
+export { RUSHOUR_PAYLOAD_SCHEMA };

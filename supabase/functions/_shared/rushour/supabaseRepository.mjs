@@ -44,8 +44,10 @@ export function createSupabaseOutboxRepository(db) {
   }
 
   return {
-    async claim({ workerId, limit }) {
-      const { data, error } = await db.rpc('rushour_claim_outbox', { p_worker_id: workerId, p_limit: limit });
+    async claim({ workerId, limit, reclaimStale = true }) {
+      const { data, error } = await db.rpc('rushour_claim_outbox', {
+        p_worker_id: workerId, p_limit: limit, p_reclaim_stale: reclaimStale === true
+      });
       if (error) throw dbError('claim');
       return (data ?? []).map(toOutboxEntry);
     },
@@ -55,7 +57,7 @@ export function createSupabaseOutboxRepository(db) {
         db.from('orders').select(ORDER_COLUMNS).eq('id', entry.orderId).maybeSingle(),
         db.from('order_items').select(ITEM_COLUMNS).eq('order_id', entry.orderId),
         db.from('restaurant_rushour_connections')
-          .select('restaurant_id,rushour_integration_id,rushour_store_id,enabled')
+          .select('restaurant_id,rushour_integration_id,rushour_store_id,enabled,payment_required,target_environment')
           .eq('restaurant_id', entry.restaurantId)
           .maybeSingle()
       ]);
@@ -99,6 +101,14 @@ export function createSupabaseOutboxRepository(db) {
         p_retry_in_seconds: retryInSeconds
       });
       if (error) throw dbError('mark_failed');
+      return data;
+    },
+
+    async markUncertain({ id, workerId, errorCode, errorMessage }) {
+      const { data, error } = await db.rpc('rushour_mark_uncertain', {
+        p_outbox_id: id, p_worker_id: workerId, p_error_code: errorCode, p_error_message: errorMessage
+      });
+      if (error) throw dbError('mark_uncertain');
       return data;
     },
 

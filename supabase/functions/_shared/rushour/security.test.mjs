@@ -40,7 +40,8 @@ test('W. événement de log : liste blanche de champs, jamais de payload', () =>
     error: new RushourError(ErrorCategory.AUTH_ERROR, 'HTTP_401', `refused token=${FAKE_SECRETS.accessToken}`, { httpStatus: 401 })
   });
   assert.deepEqual(Object.keys(event).sort(), [
-    'attempt', 'error_category', 'error_code', 'http_status', 'message', 'order_id', 'outbox_id', 'restaurant_id', 'outcome', 'step'
+    'attempt', 'duration_ms', 'endpoint', 'error_category', 'error_code', 'http_status', 'message', 'order_id', 'outbox_id',
+    'restaurant_id', 'outcome', 'step'
   ].sort());
   assert.doesNotMatch(JSON.stringify(event), /DO-NOT-LEAK/);
 });

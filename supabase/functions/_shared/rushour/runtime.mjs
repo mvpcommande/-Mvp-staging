@@ -1,16 +1,42 @@
 /**
  * Configuration d'exécution de l'Edge Function, à partir de l'environnement.
  *
- * GARDE-FOU (Bloc 1.1) : RUSHOUR_MODE=mock force le RushourMockClient,
- * même si RUSHOUR_APP_ID / RUSHOUR_APP_SECRET (ou toute autre variable)
- * sont présents par erreur. Ce module ne lit JAMAIS ces variables et
- * n'importe pas RushourHttpClient : aucun chemin de code ne peut
- * atteindre l'API RusHour depuis cette version.
+ * MODES :
+ * - mock (DÉFAUT) : RushourMockClient, zéro réseau. RUSHOUR_APP_ID /
+ *   RUSHOUR_APP_SECRET ne sont même pas lus, même s'ils sont présents.
+ * - live : RushourHttpClient, UNIQUEMENT si TOUS les verrous sont levés :
+ *     1. projet Supabase = staging autorisé (jamais la production) ;
+ *     2. profil d'API ET schéma de payload RusHour vérifiés (Bloc 2 :
+ *        ils ne le sont pas -> live impossible) ;
+ *     3. RUSHOUR_APP_ID + RUSHOUR_APP_SECRET présents (secrets serveur) ;
+ *     4. le client n'accepte que les destinations target_environment='test'.
+ *   Tout verrou manquant -> 503, aucun appel réseau (fail closed).
+ * Aucune autre valeur de RUSHOUR_MODE n'est acceptée.
  */
 
 import { RushourMockClient, MOCK_SCENARIOS } from './mockClient.mjs';
+import { RushourHttpClient } from './httpClient.mjs';
+import { RUSHOUR_API_PROFILE } from './apiProfile.mjs';
+import { RUSHOUR_PAYLOAD_SCHEMA } from './mapper.mjs';
 
-export const SUPPORTED_MODES = Object.freeze(['mock']);
+export const SUPPORTED_MODES = Object.freeze(['mock', 'live']);
+
+// Bloc 2 : le seul projet autorisé à parler à la VRAIE API RusHour est le
+// staging Foodatoi. Ouvrir la production = modification de code revue.
+export const LIVE_ALLOWED_PROJECT_REFS = Object.freeze(['kkhlpeqherxfdnilewkp']);
+export const PRODUCTION_PROJECT_REFS = Object.freeze(['ffuykessameuonpnyiyc']);
+export const LIVE_ALLOWED_TARGETS = Object.freeze(['test']);
+
+export function projectRefFromUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host.endsWith('.supabase.co') ? host.split('.')[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+const liveClients = new Map();
 export const MIN_DISPATCH_SECRET_LENGTH = 32;
 
 // Un client mock par configuration et par isolate : l'état "côté RusHour
@@ -54,14 +80,53 @@ function parseRetryAfterSeconds(raw) {
   return value;
 }
 
+function resolveLiveRuntime(getEnv, { profile, payloadSchema, fetchImpl }) {
+  const ref = projectRefFromUrl(getEnv('SUPABASE_URL'));
+  if (ref !== null && PRODUCTION_PROJECT_REFS.includes(ref)) {
+    throw new RuntimeConfigError('live_forbidden_on_production', 503);
+  }
+  if (ref === null || !LIVE_ALLOWED_PROJECT_REFS.includes(ref)) {
+    throw new RuntimeConfigError('live_project_not_allowed', 503);
+  }
+  if (profile?.verified !== true || payloadSchema?.verified !== true) {
+    throw new RuntimeConfigError('live_profile_unverified', 503);
+  }
+  const appId = getEnv('RUSHOUR_APP_ID');
+  const appSecret = getEnv('RUSHOUR_APP_SECRET');
+  if (!appId || !appSecret) {
+    throw new RuntimeConfigError('live_credentials_missing', 503);
+  }
+  const timeoutMs = parseTimeout(getEnv('RUSHOUR_SEND_TIMEOUT_MS'));
+  const key = `${profile.id}|${appId}`;
+  if (!liveClients.has(key)) {
+    liveClients.set(key, new RushourHttpClient({
+      profile, appId, appSecret, fetchImpl,
+      allowedTargets: [...LIVE_ALLOWED_TARGETS],
+      // Le client coupe AVANT le délai du dispatcher : c'est lui qui qualifie
+      // l'ambiguïté (UNCERTAIN) avec le code le plus précis.
+      timeoutMs: Math.max(500, Math.min(timeoutMs - 1000, 8000))
+    }));
+  }
+  return { mode: 'live', client: liveClients.get(key), timeoutMs, scenarios: [] };
+}
+
 /**
  * @param {(name: string) => string|undefined} getEnv
- * @returns {{ mode: 'mock', client: RushourMockClient, timeoutMs: number, scenarios: string[] }}
+ * @param {{ profile?: object, payloadSchema?: object, fetchImpl?: typeof fetch }} [overrides]
+ *   réservé aux tests : le runtime de l'Edge Function utilise les profils
+ *   committés (non vérifiés au Bloc 2).
  */
-export function resolveRuntime(getEnv) {
+export function resolveRuntime(getEnv, overrides = {}) {
   const mode = getEnv('RUSHOUR_MODE') ?? 'mock';
   if (!SUPPORTED_MODES.includes(mode)) {
-    throw new RuntimeConfigError('real_mode_not_available', 503);
+    throw new RuntimeConfigError('unsupported_mode', 503);
+  }
+  if (mode === 'live') {
+    return resolveLiveRuntime(getEnv, {
+      profile: overrides.profile ?? RUSHOUR_API_PROFILE,
+      payloadSchema: overrides.payloadSchema ?? RUSHOUR_PAYLOAD_SCHEMA,
+      fetchImpl: overrides.fetchImpl ?? globalThis.fetch
+    });
   }
   const scenarios = parseScenarios(getEnv('RUSHOUR_MOCK_SCENARIO'));
   const timeoutMs = parseTimeout(getEnv('RUSHOUR_SEND_TIMEOUT_MS'));

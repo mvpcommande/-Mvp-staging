@@ -21,7 +21,11 @@ export const ErrorCategory = Object.freeze({
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   RATE_LIMIT: 'RATE_LIMIT',
   TIMEOUT: 'TIMEOUT',
-  UNKNOWN: 'UNKNOWN'
+  UNKNOWN: 'UNKNOWN',
+  // Envoi AMBIGU (la commande a peut-être été créée côté RusHour) : jamais
+  // rejoué automatiquement tant que la déduplication RusHour n'est pas
+  // confirmée ; résolution humaine (rushour_resolve_uncertain).
+  UNCERTAIN: 'UNCERTAIN'
 });
 
 const CATEGORIES = new Set(Object.values(ErrorCategory));

@@ -75,10 +75,71 @@ test('N. un client qui ignore le signal d’annulation ne bloque pas le worker',
   const { outbox } = setup();
   const { order, items } = simpleOrderA();
   await outbox.insertOrder(order, items);
-  const hanging = { sendOrder: () => new Promise(() => {}) };
+  const hanging = { idempotencyGuaranteed: true, sendOrder: () => new Promise(() => {}) };
   const summary = await run(outbox, hanging);
   assert.equal(summary.retryScheduled, 1);
   assert.equal(outbox.rowForOrder(order.id).lastErrorCode, 'TIMEOUT');
+});
+
+test('Bloc 2 : client SANS idempotence garantie + délai dépassé -> UNCERTAIN, aucun retry', async () => {
+  const { outbox, clock } = setup();
+  const { order, items } = simpleOrderA();
+  await outbox.insertOrder(order, items);
+  const hanging = { sendOrder: () => new Promise(() => {}) };
+  const summary = await run(outbox, hanging);
+  assert.equal(summary.uncertain, 1);
+  const row = outbox.rowForOrder(order.id);
+  assert.equal(row.status, 'UNCERTAIN');
+  assert.equal(row.lastErrorCode, 'DISPATCH_DEADLINE_AMBIGUOUS');
+  clock.now += 86_400_000;
+  assert.equal((await run(outbox, hanging)).claimed, 0, 'UNCERTAIN n’est jamais réclamé à nouveau');
+  assert.equal(outbox.events.at(-1).outcome, 'COMPLETION_UNCERTAIN');
+  assert.equal(outbox.events.at(-1).endpoint, 'orders.create');
+});
+
+test('Bloc 2 : client sans idempotence -> un bail expiré passe UNCERTAIN au lieu d’être rejoué', async () => {
+  const { outbox, clock } = setup();
+  const { order, items } = simpleOrderA();
+  await outbox.insertOrder(order, items);
+  await outbox.claim({ workerId: 'worker-dead', limit: 1 });
+  clock.now += 601_000;
+  const client = { sendOrder: async () => { throw new Error('ne doit pas être appelé'); } };
+  const summary = await run(outbox, client, 'worker-alive');
+  assert.equal(summary.claimed, 0);
+  assert.equal(outbox.rowForOrder(order.id).status, 'UNCERTAIN');
+  assert.equal(outbox.rowForOrder(order.id).lastErrorCode, 'LEASE_EXPIRED_UNCERTAIN');
+});
+
+test('Bloc 2 : payment gate configurable par restaurant', async () => {
+  const { outbox } = setup({ connections: [{ ...CONNECTIONS.A, payment_required: true }, CONNECTIONS.B] });
+  const atStoreA = simpleOrderA();
+  const paidA = simpleOrderA({ payment_status: 'PAID' });
+  const pendingA = simpleOrderA({ payment_status: 'PENDING' });
+  const unknownB = orderRow({ restaurantId: RESTAURANT_B, payment_status: 'SOMETHING_ELSE',
+    items: [itemRow(null, PRODUCTS.B_PIZZA, 'Pizza', 1, 1100)] });
+  const atStoreB = orderRow({ restaurantId: RESTAURANT_B, items: [itemRow(null, PRODUCTS.B_PIZZA, 'Pizza', 1, 1100)] });
+  for (const f of [atStoreA, paidA, pendingA, unknownB, atStoreB]) await outbox.insertOrder(f.order, f.items);
+
+  const client = new RushourMockClient();
+  const summary = await run(outbox, client);
+  assert.equal(summary.sent, 2);
+  assert.equal(outbox.rowForOrder(paidA.order.id).status, 'SENT', 'A (paiement requis) : PAID exporté');
+  assert.equal(outbox.rowForOrder(atStoreA.order.id).status, 'PENDING', 'A (paiement requis) : PAY_AT_STORE bloqué');
+  assert.equal(outbox.rowForOrder(pendingA.order.id).status, 'PENDING', 'PENDING toujours bloqué');
+  assert.equal(outbox.rowForOrder(atStoreB.order.id).status, 'SENT', 'B (paiement non requis) : PAY_AT_STORE exporté');
+  assert.equal(outbox.rowForOrder(unknownB.order.id).status, 'PENDING', 'statut de paiement inconnu : bloqué (liste blanche)');
+  assert.equal(outbox.rowForOrder(pendingA.order.id).attempts, 0, 'aucune tentative consommée');
+});
+
+test('Bloc 2 : défense en profondeur du payment gate dans le dispatcher', async () => {
+  const { outbox } = setup({ connections: [{ ...CONNECTIONS.A, payment_required: true }] });
+  const { order, items } = simpleOrderA();
+  const row = await outbox.insertOrder(order, items);
+  row.status = 'SENDING'; row.lockedBy = 'w'; row.lockedAt = 0; row.attempts = 1;
+  const client = new RushourMockClient();
+  const result = await dispatchOutboxEntry({ ...row }, { repo: outbox, client, workerId: 'w', timeoutMs: 50 });
+  assert.equal(result.error.code, 'PAYMENT_NOT_ELIGIBLE');
+  assert.equal(client.callCount, 0);
 });
 
 // O / P / Q / R. erreurs HTTP

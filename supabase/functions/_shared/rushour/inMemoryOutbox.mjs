@@ -84,19 +84,29 @@ export class InMemoryOutbox {
 
   // --- port repository (même contrat que supabaseRepository) ------------
 
-  async claim({ workerId, limit }) {
+  async claim({ workerId, limit, reclaimStale = true }) {
     const now = this._now();
     const claimed = [];
+    if (!reclaimStale) {
+      for (const row of this.rows.values()) {
+        if (row.status === OUTBOX_STATUS.SENDING && row.lockedAt <= now - this._leaseMs) {
+          Object.assign(row, { status: 'UNCERTAIN', lockedAt: null, lockedBy: null,
+            lastErrorCode: 'LEASE_EXPIRED_UNCERTAIN', lastErrorCategory: 'UNCERTAIN' });
+        }
+      }
+    }
     const candidates = [...this.rows.values()].sort((a, b) => a.nextAttemptAt - b.nextAttemptAt);
 
     for (const row of candidates) {
       if (claimed.length >= limit) break;
       const connection = this.connections.get(row.restaurantId);
       const order = this.orders.get(row.orderId);
-      if (!connection?.enabled || order?.payment_status === 'PENDING') continue;
+      const paid = order?.payment_status === 'PAID'
+        || (order?.payment_status === 'PAY_AT_STORE' && connection?.payment_required !== true);
+      if (!connection?.enabled || !paid) continue;
 
       const due = row.status === OUTBOX_STATUS.PENDING && row.nextAttemptAt <= now;
-      const staleLease = row.status === OUTBOX_STATUS.SENDING && row.lockedAt <= now - this._leaseMs;
+      const staleLease = reclaimStale && row.status === OUTBOX_STATUS.SENDING && row.lockedAt <= now - this._leaseMs;
       if (!(due || staleLease) || row.attempts >= row.maxAttempts) continue;
 
       row.status = OUTBOX_STATUS.SENDING;
@@ -148,6 +158,14 @@ export class InMemoryOutbox {
       lastError: errorMessage
     });
     return row.status;
+  }
+
+  async markUncertain({ id, workerId, errorCode, errorMessage }) {
+    const row = this.rows.get(id);
+    if (!row || row.status !== OUTBOX_STATUS.SENDING || row.lockedBy !== workerId) return 'LEASE_LOST';
+    Object.assign(row, { status: 'UNCERTAIN', lockedAt: null, lockedBy: null,
+      lastErrorCode: errorCode, lastErrorCategory: 'UNCERTAIN', lastError: errorMessage });
+    return 'UNCERTAIN';
   }
 
   async logEvent(event) {

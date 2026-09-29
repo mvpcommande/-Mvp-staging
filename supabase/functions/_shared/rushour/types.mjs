@@ -50,7 +50,8 @@ export const OUTBOX_STATUS = Object.freeze({
   PENDING: 'PENDING',
   SENDING: 'SENDING',
   SENT: 'SENT',
-  FAILED: 'FAILED'
+  FAILED: 'FAILED',
+  UNCERTAIN: 'UNCERTAIN'
 });
 
 // Bornes identiques à create_order() (quantité 1..99).

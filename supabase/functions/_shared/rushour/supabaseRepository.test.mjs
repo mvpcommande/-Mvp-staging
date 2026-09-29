@@ -1,18 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
 import { createSupabaseOutboxRepository, toOutboxEntry } from './supabaseRepository.mjs';
 import { ErrorCategory } from './errors.mjs';
 
-const MIGRATION = readFileSync(
-  new URL('../../../migrations/20260928090000_rushour_connector_foundation.sql', import.meta.url), 'utf8');
+const MIGRATIONS_DIR = new URL('../../../migrations/', import.meta.url);
+const RUSHOUR_MIGRATIONS = readdirSync(MIGRATIONS_DIR).filter(f => /rushour/.test(f)).sort()
+  .map(f => readFileSync(new URL(f, MIGRATIONS_DIR), 'utf8'));
+const MIGRATION = RUSHOUR_MIGRATIONS.join('\n');
 
-/** Paramètres déclarés d'une fonction SQL de la migration. */
+/** Paramètres de la DERNIÈRE définition d'une fonction SQL (migrations triées). */
 function sqlParams(fnName) {
-  const match = MIGRATION.match(new RegExp(`function public\\.${fnName}\\(([^)]*)\\)`, 'm'));
-  assert.ok(match, `fonction ${fnName} absente de la migration`);
-  return [...match[1].matchAll(/\b(p_[a-z_]+)\b/g)].map(m => m[1]);
+  const matches = [...MIGRATION.matchAll(new RegExp(`create or replace function public\\.${fnName}\\(([^)]*)\\)`, 'gm'))];
+  assert.ok(matches.length > 0, `fonction ${fnName} absente des migrations`);
+  return [...matches.at(-1)[1].matchAll(/\b(p_[a-z_]+)\b/g)].map(m => m[1]);
 }
 
 /** Faux client supabase-js : enregistre les appels, renvoie des réponses scriptées. */
@@ -48,6 +50,7 @@ test('contrat repo ↔ SQL : noms de RPC et de paramètres identiques à la migr
   await repo.claim({ workerId: 'w', limit: 3 });
   await repo.markSent({ id: 'o', workerId: 'w', externalOrderId: null });
   await repo.markFailed({ id: 'o', workerId: 'w', errorCode: 'X', errorCategory: 'TIMEOUT', errorMessage: 'm', retryInSeconds: 5 });
+  await repo.markUncertain({ id: 'o', workerId: 'w', errorCode: 'X', errorMessage: 'm' });
 
   for (const call of db.calls.filter(c => c.rpc)) {
     assert.deepEqual(Object.keys(call.args).sort(), sqlParams(call.rpc).sort(), call.rpc);
@@ -69,11 +72,11 @@ test('contrat repo ↔ SQL : colonnes outbox et journal cohérentes avec la migr
   const db = fakeDb();
   const repo = createSupabaseOutboxRepository(db);
   const event = { outbox_id: 'o', restaurant_id: 'r', order_id: 'ord', step: 'SEND', outcome: 'SENT',
-    attempt: 1, error_category: null, error_code: null, http_status: null, message: null };
+    attempt: 1, error_category: null, error_code: null, http_status: null, message: null, duration_ms: 12, endpoint: 'orders.create' };
   await repo.logEvent(event);
   const eventsTable = MIGRATION.slice(MIGRATION.indexOf('create table public.rushour_sync_events'));
   for (const col of Object.keys(event)) {
-    assert.match(eventsTable, new RegExp(`\\n\\s+${col} `), `colonne journal ${col}`);
+    assert.match(eventsTable, new RegExp(`(\\n\\s+|add column if not exists )${col} `), `colonne journal ${col}`);
   }
 });
 

@@ -402,6 +402,16 @@ async function scenarios() {
   const vOk = await invoke({ secret: vaultSecret });
   check(vOk.status === 200 && outbox(vOrder.id).status === 'SENT', 'Vault : bon secret (vérifié par RPC) -> dispatch -> SENT');
 
+  // ------------------------------------ mode live verrouillé (Bloc 2)
+  await startFunction({ RUSHOUR_MODE: 'live', RUSHOUR_APP_ID: 'fake-app', RUSHOUR_APP_SECRET: 'fake-secret-e2e' });
+  const liveOrder = await placeOrder([item(P1, 1)]);
+  const live = await invoke();
+  check(live.status === 503 && /live_/.test(live.body.error) && outbox(liveOrder.id).status === 'PENDING',
+    `mode live refusé (503 ${live.body.error}), aucune commande touchée, aucun réseau`);
+  await startFunction();
+  await invoke();
+  check(outbox(liveOrder.id).status === 'SENT', 'retour en mock : la commande en attente part normalement');
+
   // --------------------------------------------------------------- bilan
   check(one(`select count(*) from public.rushour_order_outbox group by order_id having count(*) > 1`) === '',
     'global : aucune commande avec deux outbox');

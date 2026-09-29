@@ -43,13 +43,16 @@ export const isRetryableCategory = category => RETRY_CATEGORIES.has(category);
 /**
  * @param {{ category: string, attempt: number, maxAttempts?: number, retryAfterMs?: number|null }} input
  *   attempt = numéro (1-based) de la tentative qui vient d'échouer.
- * @returns {{ action: 'RETRY', delaySeconds: number } | { action: 'FAIL', reason: string }}
+ * @returns {{ action: 'RETRY', delaySeconds: number } | { action: 'FAIL' | 'UNCERTAIN', reason: string }}
  */
 export function decideRetry({ category, attempt, maxAttempts, retryAfterMs = null }, policy = DEFAULT_RETRY_POLICY) {
   const max = maxAttempts ?? policy.maxAttempts;
 
   if (!Number.isSafeInteger(attempt) || attempt < 1) {
     throw new RangeError('attempt doit être un entier >= 1');
+  }
+  if (category === ErrorCategory.UNCERTAIN) {
+    return { action: 'UNCERTAIN', reason: 'COMPLETION_UNCERTAIN' };
   }
   if (!isRetryableCategory(category)) {
     return { action: 'FAIL', reason: 'NOT_RETRYABLE' };

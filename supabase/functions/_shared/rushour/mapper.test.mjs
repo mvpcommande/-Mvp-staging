@@ -136,7 +136,8 @@ test('E. restaurant A -> intégration A', async () => {
 test('F. restaurant B -> intégration B (store optionnel conservé)', async () => {
   const fixture = orderRow({ restaurantId: RESTAURANT_B, items: [itemRow(null, PRODUCTS.B_PIZZA, 'Pizza', 1, 1100)] });
   const destination = resolveRushourDestination(CONNECTIONS.B, RESTAURANT_B);
-  assert.deepEqual(destination, { restaurantId: RESTAURANT_B, integrationId: 'test-integration-b', storeId: 'test-store-b' });
+  assert.deepEqual(destination, { restaurantId: RESTAURANT_B, integrationId: 'test-integration-b', storeId: 'test-store-b',
+    paymentRequired: false, targetEnvironment: 'test' });
   const payload = await mapFixture(fixture, CONNECTIONS.B);
   assert.equal(payload.items[0].productId, 'rh-b-pizza');
 });

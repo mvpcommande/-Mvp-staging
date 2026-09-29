@@ -497,4 +497,85 @@ do $$ begin
 end $$;
 reset role;
 
+-- ---------------------------------------------------------------------------
+-- 9. Bloc 2 : payment gate, UNCERTAIN, reprise de bail, métriques
+-- ---------------------------------------------------------------------------
+update public.rushour_order_outbox set next_attempt_at = now() + interval '1 day' where status = 'PENDING';
+do $$
+declare v_store uuid; v_paid uuid; v_pending uuid; v_weird uuid; v_row public.rushour_order_outbox; v_n int;
+begin
+  update public.restaurant_rushour_connections set payment_required = true where restaurant_id = '0a000000-0000-4000-8000-00000000000a';
+  v_store := pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000001', 1, 'gate-store');
+  v_pending := pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000001', 1, 'gate-pending', 'ONLINE');
+  v_paid := pg_temp.t_order('0a000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000001', 1, 'gate-paid', 'ONLINE');
+  update public.orders set payment_status = 'PAID' where id = v_paid;
+  v_weird := pg_temp.t_order('0b000000-0000-4000-8000-00000000000b', 'b1000000-0000-4000-8000-000000000001', 1, 'gate-weird');
+  update public.orders set payment_status = 'REFUNDED' where id = v_weird;
+
+  perform pg_temp.check((select array_agg(order_id) from public.rushour_claim_outbox('gate-worker', 100)) = array[v_paid],
+    'payment gate : seul PAID est réclamé quand payment_required = true (PAY_AT_STORE, PENDING, statut inconnu bloqués)');
+  perform pg_temp.check((select attempts from public.rushour_order_outbox where order_id = v_store) = 0
+    and (select attempts from public.rushour_order_outbox where order_id = v_pending) = 0,
+    'payment gate : aucune tentative consommée par les commandes bloquées');
+  update public.restaurant_rushour_connections set payment_required = false where restaurant_id = '0a000000-0000-4000-8000-00000000000a';
+  perform pg_temp.check((select array_agg(order_id) from public.rushour_claim_outbox('gate-worker2', 100)) = array[v_store],
+    'payment_required = false : PAY_AT_STORE redevient éligible, PENDING toujours bloqué');
+  perform pg_temp.check(not exists (select 1 from public.rushour_claim_outbox('gate-worker3', 100) where order_id in (v_pending, v_weird)),
+    'PENDING et statut inconnu jamais réclamés (liste blanche)');
+
+  -- UNCERTAIN : jamais réclamé, résolu humainement.
+  perform pg_temp.check(public.rushour_mark_uncertain(
+      (select id from public.rushour_order_outbox where order_id = v_paid), 'wrong-worker', 'X', 'x') = 'LEASE_LOST',
+    'mark_uncertain sans bail : refusé');
+  perform pg_temp.check(public.rushour_mark_uncertain(
+      (select id from public.rushour_order_outbox where order_id = v_paid), 'gate-worker', 'ORDER_TIMEOUT_AMBIGUOUS', 'timeout') = 'UNCERTAIN',
+    'mark_uncertain avec bail : UNCERTAIN');
+  update public.rushour_order_outbox set next_attempt_at = now() - interval '1 day' where order_id = v_paid;
+  perform pg_temp.check(not exists (select 1 from public.rushour_claim_outbox('gate-worker4', 100) where order_id = v_paid),
+    'UNCERTAIN jamais réclamé automatiquement');
+  perform pg_temp.check(public.rushour_requeue(v_paid) = false, 'requeue simple refusé sur UNCERTAIN (résolution explicite requise)');
+  perform pg_temp.check(public.rushour_resolve_uncertain(v_paid, false) = 'PENDING', 'résolution "absente de RusHour" -> PENDING');
+  perform pg_temp.check((select attempts = 0 and export_key = public.rushour_export_key(v_paid, 'itg-a')
+      from public.rushour_order_outbox where order_id = v_paid), 'résolution : même clé d''export, compteur remis à 0');
+  select * into v_row from public.rushour_claim_outbox('gate-worker5', 100) where order_id = v_paid;
+  perform public.rushour_mark_uncertain(v_row.id, 'gate-worker5', 'ORDER_RESPONSE_INVALID', 'x');
+  perform pg_temp.check(public.rushour_resolve_uncertain(v_paid, true, 'rh-verified-1') = 'SENT', 'résolution "présente dans RusHour" -> SENT');
+  perform pg_temp.check((select status || external_order_id from public.rushour_order_outbox where order_id = v_paid) = 'SENTrh-verified-1',
+    'résolution SENT : identifiant vérifié enregistré');
+  perform pg_temp.check((select count(*) from public.rushour_sync_events where order_id = v_paid and step = 'RESOLVE') = 2,
+    'résolutions journalisées');
+
+  -- Reprise de bail interdite (live, dédup non confirmée) -> UNCERTAIN.
+  select * into v_row from public.rushour_order_outbox where order_id = v_store;
+  update public.rushour_order_outbox set status = 'SENDING', locked_by = 'dead', locked_at = now() - interval '11 minutes', attempts = 1
+   where id = v_row.id;
+  v_n := (select count(*) from public.rushour_claim_outbox('live-worker', 100, false) where order_id = v_store);
+  perform pg_temp.check(v_n = 0 and (select status || '/' || last_error_code from public.rushour_order_outbox where id = v_row.id)
+      = 'UNCERTAIN/LEASE_EXPIRED_UNCERTAIN', 'p_reclaim_stale = false : bail expiré -> UNCERTAIN, jamais renvoyé');
+end $$;
+
+insert into public.rushour_sync_events (restaurant_id, step, outcome, error_category, duration_ms, endpoint)
+values ('0a000000-0000-4000-8000-00000000000a', 'SEND', 'COMPLETION_UNCERTAIN', 'UNCERTAIN', 120, 'orders.create'),
+       ('0b000000-0000-4000-8000-00000000000b', 'SEND', 'FAILED', 'AUTH_ERROR', 80, 'orders.create');
+set role authenticated;
+select set_config('request.jwt.claims',
+  '{"sub":"11111111-1111-4111-8111-111111111111","app_metadata":{"role":"restaurant_admin","restaurant_id":"0a000000-0000-4000-8000-00000000000a"}}', false);
+do $$ begin
+  perform pg_temp.check((select count(*) from public.rushour_dispatch_metrics where restaurant_id <> '0a000000-0000-4000-8000-00000000000a') = 0
+    and (select sum(rushour_dispatch_uncertain) from public.rushour_dispatch_metrics) >= 1,
+    'métriques : vue soumise à la RLS (admin A ne voit que A)');
+  begin perform public.rushour_resolve_uncertain(gen_random_uuid(), true); raise exception 'FAIL - authenticated résout';
+  exception when insufficient_privilege then raise notice 'ok - authenticated ne peut pas résoudre une incertitude'; end;
+end $$;
+reset role;
+select set_config('request.jwt.claims', '', false);
+set role anon;
+do $$ begin
+  begin perform 1 from public.rushour_dispatch_metrics; raise exception 'FAIL - anon lit les métriques';
+  exception when insufficient_privilege then raise notice 'ok - anon ne lit pas les métriques'; end;
+  begin perform public.rushour_mark_uncertain(gen_random_uuid(), 'x', 'x', 'x'); raise exception 'FAIL - anon mark_uncertain';
+  exception when insufficient_privilege then raise notice 'ok - anon ne peut pas appeler rushour_mark_uncertain'; end;
+end $$;
+reset role;
+
 \echo 'SQL tests: all assertions passed'

@@ -66,6 +66,11 @@ export class RushourMockClient {
     this.acceptedOrders = new Map();
   }
 
+  /** Le mock déduplique sur la clé d'export par construction. */
+  get idempotencyGuaranteed() {
+    return true;
+  }
+
   get callCount() {
     return this.calls.length;
   }

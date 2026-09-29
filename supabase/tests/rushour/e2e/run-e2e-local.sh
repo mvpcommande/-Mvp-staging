@@ -43,6 +43,7 @@ for f in "$HERE/00_supabase_stub.sql" "$HERE/01_base_schema.sql" \
          "$ROOT/supabase/migrations/20260928090000_rushour_connector_foundation.sql" \
          "$ROOT/supabase/migrations/20260929090000_rushour_reconciliation_and_fixes.sql" \
          "$ROOT/supabase/migrations/20260929100000_rushour_dispatch_secret_vault.sql" \
+         "$ROOT/supabase/migrations/20260930090000_rushour_bloc2_payment_gate_uncertain.sql" \
          "$HERE/e2e/setup.sql"; do
   "${PSQL[@]}" "$URL" -f "$f" >/dev/null
 done
