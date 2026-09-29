@@ -10,6 +10,8 @@ export default defineConfig({
         onboarding: 'onboarding.html',
         platform: 'platform.html',
         legal: 'legal.html',
+        counter: 'counter.html',
+        chainAdmin: 'chain-admin.html',
       },
     },
   },

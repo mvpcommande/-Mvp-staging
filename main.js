@@ -28,12 +28,15 @@ import {
 
 import {
   isRestaurantOpen,
-  formatOpeningHours
+  formatOpeningHours,
+  parisTimeToIsoDate
 } from './timeFormat.mjs';
 
 import {
-  logClientError
+  logClientError,
+  installGlobalErrorLogging
 } from './errorLog.mjs';
+import { trackPageview } from './analytics.mjs';
 
 import {
   escapeHtml
@@ -50,6 +53,12 @@ import {
   setCustomerConsent,
   deleteCustomerAccount
 } from './customerAccount.mjs';
+import {
+  getMyLoyaltyAccount,
+  getLoyaltyProgram,
+  getLoyaltyRewards,
+  redeemLoyaltyReward
+} from './loyalty.mjs';
 
 import './styles.css';
 
@@ -84,13 +93,96 @@ import './styles.css';
  */
 
 let restaurant = null;
+installGlobalErrorLogging(supabase, {
+  page: 'client',
+  getRestaurantId: () => restaurant?.id ?? null
+});
+
 let menu = [];
 let cart = [];
 let activeCategory = 'Tous';
 let categoryObserver = null;
 
 let remoteStore = null;
-let checkoutIdempotencyKey = null;
+
+/*
+ * Bloc 5 (hardening) : la clé d'idempotence checkout ne survivait
+ * qu'en mémoire — un refresh juste après un create_order réussi (ou
+ * juste après l'envoi, avant confirmation visible) la perdait. Un
+ * client qui retente alors sa commande générait une clé neuve,
+ * jamais reconnue comme un retry par create_order (qui déduplique
+ * par idempotency_key) : commande dupliquée silencieuse, réelle sous
+ * un timing très plausible sur mobile (refresh accidentel, retour
+ * d'arrière-plan, double navigation) — pas seulement un cas
+ * théorique de double-clic déjà couvert par orderSubmitting.
+ *
+ * sessionStorage (jamais localStorage) : scope strictement par onglet,
+ * donc deux onglets du même client génèrent naturellement deux clés
+ * distinctes (aucune collision entre deux commandes réellement
+ * différentes), tout en survivant à un refresh dans le même onglet.
+ * Best-effort : si sessionStorage est indisponible (navigation
+ * privée restrictive...), on retombe simplement sur l'ancien
+ * comportement (clé perdue au refresh), jamais une erreur bloquante.
+ */
+const CHECKOUT_IDEMPOTENCY_STORAGE_KEY =
+  'foodatoi-checkout-idempotency-key';
+
+function readStoredIdempotencyKey() {
+  try {
+    return (
+      sessionStorage.getItem(
+        CHECKOUT_IDEMPOTENCY_STORAGE_KEY
+      ) || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function persistIdempotencyKey(key) {
+  try {
+    if (key) {
+      sessionStorage.setItem(
+        CHECKOUT_IDEMPOTENCY_STORAGE_KEY,
+        key
+      );
+    } else {
+      sessionStorage.removeItem(
+        CHECKOUT_IDEMPOTENCY_STORAGE_KEY
+      );
+    }
+  } catch {
+    /* best-effort, voir commentaire ci-dessus */
+  }
+}
+
+let checkoutIdempotencyKey = readStoredIdempotencyKey();
+
+/**
+ * Verrou logique anti double-soumission de submitOrder() — source de
+ * vérité indépendante de l'attribut `disabled` du bouton (purement
+ * visuel/DOM, reconstruit à chaque render). Remis à false dès qu'une
+ * tentative se termine (succès ou échec), pour qu'une commande
+ * suivante reste possible.
+ */
+let orderSubmitting = false;
+
+/**
+ * Mode de commande affiché en tête de page (À emporter / Sur
+ * place). Il n'existe aucune colonne dédiée côté données (le
+ * système reste un click-and-collect classique) : ce choix est
+ * simplement reporté dans les notes de la commande, sans toucher
+ * au modèle ni à create_order.
+ */
+let orderMode = 'takeaway';
+
+/**
+ * Étape affichée dans le tiroir panier : "review" (ticket +
+ * total) puis "details" (coordonnées + créneau + envoi). Un
+ * simple état d'écran, aucune commande n'est créée avant l'étape
+ * "details".
+ */
+let cartStep = 'review';
 
 let accountView = 'login';
 let accountError = '';
@@ -98,6 +190,9 @@ let accountLoading = false;
 let accountCustomer = null;
 let accountOrders = [];
 let accountConsents = [];
+let loyaltyAccount = null;
+let loyaltyRewardsAvailable = [];
+let loyaltyRedeeming = false;
 let accountDeleteConfirming = false;
 
 const MEATS = [
@@ -139,8 +234,28 @@ const DRINKS = [
 const app = document.querySelector('#root');
 
 /* -------------------------------------------------------------------------- */
+/* Icônes (SVG inline, monochromes — pas d'emoji décoratif)                   */
+/* -------------------------------------------------------------------------- */
+
+const ICONS = {
+  info: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="7.6" r="0.9" fill="currentColor" stroke="none"/></svg>`,
+  account: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="3.4"/><path d="M5 20c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg>`,
+  cart: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M6 8h12l-1 12H7L6 8Z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg>`,
+  arrow: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="13 6 19 12 13 18"/></svg>`,
+  chevronLeft: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 6 9 12 15 18"/></svg>`
+};
+
+/* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
+
+function prefersReducedMotion() {
+  return Boolean(
+    window.matchMedia?.(
+      '(prefers-reduced-motion: reduce)'
+    ).matches
+  );
+}
 
 const euro = value =>
   `${Number(value ?? 0)
@@ -154,11 +269,197 @@ const itemCount = () =>
     0
   );
 
+function restaurantOpenNow() {
+  return isRestaurantOpen(
+    restaurant?.settings?.opening_hours,
+    new Date()
+  );
+}
+
+/**
+ * Configuration ETA du restaurant (settings, aucune colonne
+ * dédiée) : soit une fourchette (pickup_eta_min / pickup_eta_max),
+ * soit une valeur unique (pickup_eta_minutes). Retourne null si
+ * rien n'est configuré — c'est la seule source de vérité, jamais
+ * de délai inventé côté client. Factorisé ici car réutilisé par le
+ * header (getPickupEtaLabel) et par l'estimation du panier
+ * (getCartEtaLabel), qui n'en affichent pas le même format.
+ */
+function getPickupEtaConfig() {
+  const settings = restaurant?.settings || {};
+
+  const min = Number(settings.pickup_eta_min);
+  const max = Number(settings.pickup_eta_max);
+
+  if (
+    Number.isFinite(min) &&
+    Number.isFinite(max) &&
+    min > 0 &&
+    max >= min
+  ) {
+    return { type: 'range', min, max };
+  }
+
+  const minutes = Number(settings.pickup_eta_minutes);
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return { type: 'single', minutes };
+  }
+
+  return null;
+}
+
+/**
+ * Délai de retrait affiché dans le header. Sans configuration, on
+ * n'affiche rien plutôt que d'inventer un délai identique pour
+ * tous les restaurants.
+ */
+function getPickupEtaLabel() {
+  const config = getPickupEtaConfig();
+
+  if (!config) {
+    return null;
+  }
+
+  return config.type === 'range'
+    ? `Retrait ${config.min}–${config.max} min`
+    : `Retrait ~${config.minutes} min`;
+}
+
+/**
+ * Estimation affichée dans l'écran "ticket" du panier
+ * (renderCartReview), purement informative : ne détermine jamais
+ * l'heure de retrait envoyée en base — ça reste pickupDate/
+ * pickupTime, choisis à l'étape suivante. Null si aucune ETA n'est
+ * configurée pour ce restaurant, auquel cas la ligne est masquée.
+ */
+function getCartEtaLabel() {
+  const config = getPickupEtaConfig();
+
+  if (!config) {
+    return null;
+  }
+
+  if (config.type === 'range') {
+    return `Retrait estimé : ${config.min}–${config.max} min`;
+  }
+
+  const estimate = new Date(Date.now() + config.minutes * 60 * 1000);
+
+  const timeLabel = new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).format(estimate);
+
+  return `Retrait estimé vers ${timeLabel}`;
+}
+
+/**
+ * Un produit est "populaire" seulement si le restaurant l'a
+ * explicitement marqué comme tel dans ses options (aucune
+ * statistique de vente n'est inventée côté client).
+ */
+function isPopular(item) {
+  const options = item.options || {};
+
+  return Boolean(
+    options.popular ||
+    options.is_popular ||
+    options.bestseller ||
+    options.is_bestseller ||
+    options.badge === 'populaire' ||
+    options.badge === 'popular'
+  );
+}
+
+/**
+ * "Nouveau" s'appuie uniquement sur une intention explicite du
+ * restaurant (option produit), jamais sur products.created_at : la
+ * date de création en base ne reflète pas la nouveauté commerciale
+ * (import de menu, resynchronisation, etc. peuvent la modifier sans
+ * rapport avec un vrai lancement produit).
+ */
+function isNewProduct(item) {
+  const options = item.options || {};
+
+  return Boolean(
+    options.new ||
+    options.is_new ||
+    options.badge === 'nouveau' ||
+    options.badge === 'new'
+  );
+}
+
+/**
+ * Un produit nécessite le configurateur (bottom sheet) dès qu'il a
+ * au moins un choix à faire ; sinon le bouton [+] ajoute directement.
+ */
+function productNeedsOptions(item) {
+  return Boolean(
+    item.meat ||
+    item.sauce ||
+    item.drink ||
+    (Array.isArray(item.options?.groups) && item.options.groups.length)
+  );
+}
+
+/**
+ * Max 4 produits marqués populaires par le restaurant. Tableau
+ * vide si aucun produit n'est marqué => la section reste masquée
+ * (voir render()), plutôt que d'inventer un classement.
+ */
+function getBestSellers() {
+  return menu.filter(isPopular).slice(0, 4);
+}
+
 function getRestaurantDisplayName() {
   return (
     restaurant?.name ||
     'FOODATOI'
   );
+}
+
+/**
+ * Mots vides à ignorer pour le monogramme (articles/liaisons
+ * français les plus courants), pour éviter des initiales comme
+ * "LA" au lieu de "MM" sur "La Maison Métisse".
+ */
+const BRAND_INITIALS_STOPWORDS = new Set([
+  'le', 'la', 'les', 'l', 'un', 'une', 'des', 'du', 'de', 'd', 'et'
+]);
+
+/**
+ * Monogramme de repli quand logo_url est absent : initiales des
+ * mots significatifs du nom (jamais les 2 premières lettres brutes,
+ * qui donnent des résultats absurdes comme "Caz Food" -> "CA").
+ * Retourne '' si aucune initiale exploitable (le monogramme est
+ * alors masqué plutôt que d'afficher un rendu cassé).
+ */
+function getBrandInitials(name) {
+  const words = String(name || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (!words.length) {
+    return '';
+  }
+
+  const significant = words.filter(
+    word => !BRAND_INITIALS_STOPWORDS.has(
+      word.toLowerCase().replace(/['’]/g, '')
+    )
+  );
+
+  const source = significant.length ? significant : words;
+
+  return source
+    .slice(0, 2)
+    .map(word => word.charAt(0))
+    .join('')
+    .toUpperCase();
 }
 
 function getRestaurantPhone() {
@@ -365,7 +666,11 @@ function normalizeProduct(product) {
       Boolean(
         options.tripleMeat ||
         options.triple_meat
-      )
+      ),
+
+    createdAt:
+      product.created_at ||
+      null
   };
 }
 
@@ -519,29 +824,15 @@ function groupByCategory(items) {
 
 function renderLoading() {
   app.innerHTML = `
-    <div class="app-frame">
+    <div class="app-frame client-app">
 
       <main>
 
-        <section class="order-intro">
-
-          <div class="intro-copy">
-
-            <p class="eyebrow">
-              FOODATOI
-            </p>
-
-            <h1>
-              Chargement<br>
-              <em>du restaurant.</em>
-            </h1>
-
-            <p class="intro-lede">
-              Nous préparons la carte.
-            </p>
-
-          </div>
-
+        <section class="oi-state-screen">
+          <div class="oi-state-spinner" aria-hidden="true"></div>
+          <p class="eyebrow">FOODATOI</p>
+          <h1>Chargement du restaurant…</h1>
+          <p class="oi-state-lede">Nous préparons la carte.</p>
         </section>
 
       </main>
@@ -563,38 +854,15 @@ function renderError(error) {
   });
 
   app.innerHTML = `
-    <div class="app-frame">
+    <div class="app-frame client-app">
 
       <main>
 
-        <section class="order-intro">
-
-          <div class="intro-copy">
-
-            <p class="eyebrow">
-              FOODATOI
-            </p>
-
-            <h1>
-              Restaurant<br>
-              <em>indisponible.</em>
-            </h1>
-
-            <p class="intro-lede">
-              La configuration de ce restaurant
-              n'est pas encore disponible.
-            </p>
-
-            <div class="pickup-line">
-
-              <span>
-                Vérifie l'URL ou réessaie plus tard.
-              </span>
-
-            </div>
-
-          </div>
-
+        <section class="oi-state-screen">
+          <p class="eyebrow">FOODATOI</p>
+          <h1>Restaurant indisponible</h1>
+          <p class="oi-state-lede">La configuration de ce restaurant n'est pas encore disponible.</p>
+          <p class="oi-state-hint">Vérifie l'URL ou réessaie plus tard.</p>
         </section>
 
       </main>
@@ -608,307 +876,156 @@ function renderError(error) {
 /* -------------------------------------------------------------------------- */
 
 function render() {
-  const categories =
-    getCategories();
-
-  const displayName =
-    getRestaurantDisplayName();
-
-  const address =
-    getRestaurantAddress();
-
-  const phone =
-    getRestaurantPhone();
+  const categories = getCategories();
+  const displayName = getRestaurantDisplayName();
+  const address = getRestaurantAddress();
+  const phone = getRestaurantPhone();
+  const openNow = restaurantOpenNow();
+  const bestSellers = getBestSellers();
+  const count = itemCount();
+  const cartTotal = calculateTotal(cart);
+  const brandInitials = getBrandInitials(displayName);
+  const pickupEtaLabel = getPickupEtaLabel();
 
   app.innerHTML = `
-    <div class="app-frame">
+    <div class="app-frame client-app">
 
-      <header class="masthead">
+      <header class="oi-header">
 
-        <div class="brand-lockup">
+        <div class="oi-header-row">
 
-          ${
-            restaurant?.logo_url
-              ? `
-                <img
-                  class="brand-mark-image"
-                  src="${escapeHtml(
-                    restaurant.logo_url
-                  )}"
-                  alt="${escapeHtml(
-                    displayName
-                  )}"
-                >
-              `
-              : `
-                <span class="brand-mark">
-                  ${escapeHtml(
-                    displayName
-                      .slice(0, 2)
-                      .toUpperCase()
-                  )}
+          <div class="brand-lockup">
+
+            ${
+              restaurant?.logo_url
+                ? `<img class="brand-mark-image" src="${escapeHtml(restaurant.logo_url)}" alt="${escapeHtml(displayName)}">`
+                : brandInitials
+                  ? `<span class="brand-mark">${escapeHtml(brandInitials)}</span>`
+                  : ''
+            }
+
+            <div class="oi-brand-meta">
+              <strong>${escapeHtml(displayName)}</strong>
+              <div class="oi-status-line">
+                <span class="oi-status-badge ${openNow ? 'is-open' : 'is-closed'}">
+                  <span class="oi-status-dot"></span>
+                  ${openNow ? 'Ouvert' : 'Fermé'}
                 </span>
-              `
-          }
+                ${pickupEtaLabel ? `<span class="oi-eta">${escapeHtml(pickupEtaLabel)}</span>` : ''}
+              </div>
+            </div>
 
-          <div>
+          </div>
 
-            <strong>
-              ${escapeHtml(
-                displayName
-              )}
-            </strong>
+          <div class="masthead-actions">
 
-            <span>
-              ${escapeHtml(
-                restaurant?.sector ||
-                'RESTAURANT'
-              )}
-            </span>
+            <button class="icon-btn" id="open-info" type="button" aria-label="Informations du restaurant">
+              ${ICONS.info}
+            </button>
+
+            <button class="icon-btn" id="open-account" type="button" aria-label="Mon compte">
+              ${ICONS.account}
+            </button>
+
+            <button class="icon-btn oi-cart-btn" id="open-cart" type="button" aria-label="Panier, ${count} article${count > 1 ? 's' : ''}">
+              ${ICONS.cart}
+              <b class="oi-cart-badge${count ? '' : ' hidden'}" id="cart-badge">${count}</b>
+            </button>
 
           </div>
 
         </div>
 
-        <div class="masthead-actions">
-
-          <button
-            class="account-pill"
-            id="open-account"
-            type="button"
-          >
-            Compte
-          </button>
-
-          <button
-            class="order-pill"
-            id="open-cart"
-            type="button"
-          >
-            <span>
-              Ma commande
-            </span>
-
-            <b>
-              ${itemCount()}
-            </b>
-          </button>
-
-        </div>
+        <h2 class="oi-tagline">Choisis. <em>On prépare.</em></h2>
 
       </header>
 
       <main>
 
-        <section class="order-intro">
-
-          <div class="intro-copy">
-
-            <p class="eyebrow">
-              COMMANDE DIRECTE
-            </p>
-
-            <h1>
-              Choisis.<br>
-              <em>On prépare.</em>
-            </h1>
-
-            <p class="intro-lede">
-              Ton repas, directement chez
-              ${escapeHtml(
-                displayName
-              )}.
-              Pas de détour, pas de plateforme.
-            </p>
-
-            <div class="pickup-line">
-
-              <span class="live-dot"></span>
-
-              <span>
-                Retrait sur place
-              </span>
-
-              <span class="slash">
-                /
-              </span>
-
-              <span>
-                Paiement au restaurant
-              </span>
-
-            </div>
-
+        <section class="oi-mode-section" aria-label="Mode de commande">
+          <p class="oi-mode-label">Comment souhaitez-vous commander ?</p>
+          <div class="oi-segmented" role="group" aria-label="Mode de commande">
+            <button type="button" class="oi-segmented-btn${orderMode === 'takeaway' ? ' is-active' : ''}" data-order-mode="takeaway" aria-pressed="${orderMode === 'takeaway'}">
+              À emporter
+            </button>
+            <button type="button" class="oi-segmented-btn${orderMode === 'onsite' ? ' is-active' : ''}" data-order-mode="onsite" aria-pressed="${orderMode === 'onsite'}">
+              Sur place
+            </button>
           </div>
-
-          <div
-            class="receipt-hero"
-            aria-label="Retrait sur place"
-          >
-
-            <div class="receipt-top">
-
-              <span>
-                ${escapeHtml(
-                  displayName
-                )}
-              </span>
-
-              <span>
-                AUJ.
-              </span>
-
-            </div>
-
-            <div class="receipt-hole"></div>
-
-            <div class="receipt-main">
-
-              <small>
-                TON REPAS
-              </small>
-
-              <strong>
-                COMMENCE<br>
-                ICI.
-              </strong>
-
-              ${
-                address
-                  ? `
-                    <span>
-                      ${escapeHtml(
-                        address
-                      )}
-                    </span>
-                  `
-                  : ''
-              }
-
-            </div>
-
-            <div class="receipt-barcode">
-
-              <i></i>
-              <i></i>
-              <i></i>
-              <i></i>
-              <i></i>
-              <i></i>
-              <i></i>
-
-            </div>
-
-            <div class="receipt-code">
-              FOODATOI
-            </div>
-
-          </div>
-
         </section>
 
         ${
+          !openNow
+            ? `
+              <div class="closed-banner oi-closed-banner">
+                <p class="eyebrow">Fermé actuellement</p>
+                <p>
+                  ${escapeHtml(displayName)} n'accepte pas de commande immédiate en ce moment.
+                  Tu peux composer ton panier et choisir un créneau ultérieur au moment de valider.
+                </p>
+              </div>
+            `
+            : ''
+        }
+
+        ${
+          restaurant?.settings?.delivery_mode === 'redirect' &&
           restaurant?.settings?.delivery_redirect_url
             ? `
-              <section class="delivery-banner">
-
+              <section class="delivery-banner oi-delivery-banner">
                 <div>
-
-                  <p class="eyebrow">
-                    LIVRAISON À DOMICILE
-                  </p>
-
-                  <p>
-                    ${escapeHtml(
-                      displayName
-                    )}
-                    livre aussi à domicile via Uber Eats.
-                  </p>
-
+                  <p class="eyebrow">Livraison à domicile</p>
+                  <p>${escapeHtml(displayName)} livre aussi à domicile via Uber Eats.</p>
                 </div>
-
                 <a
                   class="secondary"
-                  href="${escapeHtml(
-                    restaurant.settings.delivery_redirect_url
-                  )}"
+                  href="${escapeHtml(restaurant.settings.delivery_redirect_url)}"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
                   Commander sur Uber Eats →
                 </a>
-
               </section>
             `
             : ''
         }
 
-        <section class="menu-section">
+        ${
+          categories.length > 1
+            ? `
+              <nav class="category-rail oi-cat-rail" aria-label="Catégories">
+                ${categories
+                  .map(
+                    category => `
+                      <button
+                        class="category oi-chip"
+                        data-category="${escapeHtml(category)}"
+                        data-target="${category === 'Tous' ? 'top' : escapeHtml(slugifyCategory(category))}"
+                        type="button"
+                      >
+                        ${escapeHtml(category)}
+                      </button>
+                    `
+                  )
+                  .join('')}
+              </nav>
+            `
+            : ''
+        }
 
-          <div class="section-head">
-
-            <div>
-
-              <p class="eyebrow">
-                LA CARTE
-              </p>
-
-              <h2>
-                Tu prends quoi ?
-              </h2>
-
-            </div>
-
-            <span class="menu-count">
-
-              ${menu.length}
-
-              ${
-                menu.length > 1
-                  ? 'produits'
-                  : 'produit'
-              }
-
-            </span>
-
-          </div>
+        <section class="oi-menu">
 
           ${
-            categories.length > 1
+            bestSellers.length
               ? `
-                <nav
-                  class="category-rail"
-                  aria-label="Catégories"
-                >
-
-                  ${categories
-                    .map(
-                      category => `
-                        <button
-                          class="category"
-                          data-category="${escapeHtml(
-                            category
-                          )}"
-                          data-target="${
-                            category === 'Tous'
-                              ? 'top'
-                              : escapeHtml(
-                                  slugifyCategory(
-                                    category
-                                  )
-                                )
-                          }"
-                          type="button"
-                        >
-                          ${escapeHtml(
-                            category
-                          )}
-                        </button>
-                      `
-                    )
-                    .join('')}
-
-                </nav>
+                <section class="oi-section" id="oi-bestsellers">
+                  <div class="oi-section-head">
+                    <h2>Les plus commandés</h2>
+                  </div>
+                  <div class="oi-card-list">
+                    ${bestSellers.map(card).join('')}
+                  </div>
+                </section>
               `
               : ''
           }
@@ -918,43 +1035,22 @@ function render() {
               ? groupByCategory(menu)
                   .map(
                     group => `
-                      <section
-                        class="menu-category-section"
-                        id="menu-cat-${group.slug}"
-                      >
-
-                        <h2 class="menu-category-heading">
-                          ${escapeHtml(
-                            group.category
-                          )}
-                        </h2>
-
-                        <div class="menu-grid">
-                          ${group.items
-                            .map(card)
-                            .join('')}
+                      <section class="menu-category-section oi-section" id="menu-cat-${group.slug}">
+                        <div class="oi-section-head">
+                          <h2>${escapeHtml(group.category)}</h2>
                         </div>
-
+                        <div class="oi-card-list">
+                          ${group.items.map(card).join('')}
+                        </div>
                       </section>
                     `
                   )
                   .join('')
               : `
                 <div class="empty-ticket">
-
-                  <div class="empty-ticket-mark">
-                    +
-                  </div>
-
-                  <h3>
-                    Carte en préparation.
-                  </h3>
-
-                  <p>
-                    Ce restaurant n'a pas encore
-                    publié de produits.
-                  </p>
-
+                  <div class="empty-ticket-mark">+</div>
+                  <h3>Carte en préparation.</h3>
+                  <p>Ce restaurant n'a pas encore publié de produits.</p>
                 </div>
               `
           }
@@ -966,49 +1062,20 @@ function render() {
       <footer class="site-footer">
 
         <div>
-
-          <strong>
-            ${escapeHtml(
-              displayName
-            )}
-          </strong>
-
-          ${
-            address
-              ? `
-                <span>
-                  ${escapeHtml(
-                    address
-                  )}
-                </span>
-              `
-              : ''
-          }
-
+          <strong>${escapeHtml(displayName)}</strong>
+          ${address ? `<span>${escapeHtml(address)}</span>` : ''}
         </div>
 
         ${
-          formatOpeningHours(
-            restaurant?.settings
-              ?.opening_hours
-          ).length
+          formatOpeningHours(restaurant?.settings?.opening_hours).length
             ? `
               <div class="footer-hours">
-                ${formatOpeningHours(
-                  restaurant?.settings
-                    ?.opening_hours
-                )
+                ${formatOpeningHours(restaurant?.settings?.opening_hours)
                   .map(
-                    (line) => `
+                    line => `
                       <span>
-                        ${escapeHtml(
-                          line.label
-                        )}
-                        <b>
-                          ${escapeHtml(
-                            line.hours
-                          )}
-                        </b>
+                        ${escapeHtml(line.label)}
+                        <b>${escapeHtml(line.hours)}</b>
                       </span>
                     `
                   )
@@ -1019,103 +1086,53 @@ function render() {
         }
 
         <div>
-
+          ${phone ? `<a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a>` : ''}
           ${
-            phone
+            restaurant?.settings?.facebook_url
               ? `
-                <a
-                  href="tel:${escapeHtml(
-                    phone
-                  )}"
-                >
-                  ${escapeHtml(
-                    phone
-                  )}
-                </a>
-              `
-              : ''
-          }
-
-          ${
-            restaurant?.settings
-              ?.facebook_url
-              ? `
-                <a
-                  href="${escapeHtml(
-                    restaurant.settings
-                      .facebook_url
-                  )}"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
+                <a href="${escapeHtml(restaurant.settings.facebook_url)}" target="_blank" rel="noopener noreferrer">
                   Facebook
                 </a>
               `
               : ''
           }
-
-          <a href="/legal.html">
-            Mentions légales
-          </a>
-
+          <a href="/legal.html">Mentions légales</a>
         </div>
 
       </footer>
 
     </div>
 
-    <div
-      class="drawer-backdrop hidden"
-      id="backdrop"
-    ></div>
+    <div class="oi-sticky-cart${cart.length ? '' : ' hidden'}" id="sticky-cart-bar">
+      <button type="button" id="sticky-cart-btn" class="oi-sticky-cart-btn">
+        <span class="oi-sticky-cart-info">
+          <span class="oi-sticky-cart-count">${count} article${count > 1 ? 's' : ''}</span>
+          <span class="oi-sticky-cart-total">${euro(cartTotal)}</span>
+        </span>
+        <span class="oi-sticky-cart-cta">Voir le panier ${ICONS.arrow}</span>
+      </button>
+    </div>
 
-    <aside
-      class="drawer"
-      id="drawer"
-      aria-label="Panier"
-    >
+    <div class="drawer-backdrop hidden" id="backdrop"></div>
+
+    <aside class="drawer" id="drawer" aria-label="Panier">
 
       <div class="drawer-head">
-
         <div>
-
-          <p class="eyebrow">
-            ${escapeHtml(
-              displayName
-            )}
-          </p>
-
-          <h2>
-            Ton ticket
-          </h2>
-
+          <p class="eyebrow">${escapeHtml(displayName)}</p>
+          <h2 id="drawer-title">Votre commande</h2>
         </div>
-
-        <button
-          id="close-cart"
-          class="icon-btn"
-          type="button"
-          aria-label="Fermer"
-        >
-          ×
-        </button>
-
+        <button id="close-cart" class="icon-btn" type="button" aria-label="Fermer">×</button>
       </div>
+
+      <div id="cart-steps"></div>
 
       <div id="cart-content"></div>
 
     </aside>
 
-    <div
-      class="modal hidden"
-      id="product-modal"
-    >
-
-      <div
-        class="modal-card"
-        id="modal-content"
-      ></div>
-
+    <div class="modal hidden" id="product-modal">
+      <div class="modal-card" id="modal-content"></div>
     </div>
   `;
 
@@ -1128,90 +1145,88 @@ function render() {
 /* -------------------------------------------------------------------------- */
 
 function card(item) {
-  return `
-    <article class="menu-card">
+  const badges = [];
 
-      <div class="menu-card-media">
+  if (isPopular(item)) {
+    badges.push('<span class="oi-badge oi-badge--acid">Populaire</span>');
+  }
+
+  if (isNewProduct(item)) {
+    badges.push('<span class="oi-badge oi-badge--ink">Nouveau</span>');
+  }
+
+  return `
+    <article class="oi-card${item.imageUrl ? '' : ' oi-card--no-photo'}">
+
+      <button
+        type="button"
+        class="oi-card-main"
+        data-open="${escapeHtml(item.id)}"
+        aria-label="Voir ${escapeHtml(item.name)}"
+      >
+
+        <span class="oi-card-text">
+
+          ${badges.length ? `<span class="oi-card-badges">${badges.join('')}</span>` : ''}
+
+          <span class="oi-card-name">${escapeHtml(item.name)}</span>
+
+          ${item.description ? `<span class="oi-card-desc">${escapeHtml(item.description)}</span>` : ''}
+
+          <span class="oi-card-price">${euro(item.price)}</span>
+
+        </span>
+
         ${
           item.imageUrl
             ? `
-              <img
-                src="${escapeHtml(
-                  item.imageUrl
-                )}"
-                alt=""
-                loading="lazy"
-              >
-            `
-            : `
-              <span class="menu-card-media-fallback">
-                ${escapeHtml(
-                  item.emoji
-                )}
+              <span class="oi-card-media">
+                <img src="${escapeHtml(item.imageUrl)}" alt="" loading="lazy" width="84" height="84">
               </span>
-            `
-        }
-      </div>
-
-      <div class="menu-card-body">
-
-        <p class="eyebrow">
-          ${escapeHtml(
-            item.category
-          )}
-        </p>
-
-        <h3>
-          ${escapeHtml(
-            item.name
-          )}
-        </h3>
-
-        ${
-          item.description
-            ? `
-              <p>
-                ${escapeHtml(
-                  item.description
-                )}
-              </p>
             `
             : ''
         }
 
-      </div>
+      </button>
 
-      <div class="menu-card-bottom">
-
-        <strong>
-          ${euro(
-            item.price
-          )}
-        </strong>
-
-        <button
-          class="add-button"
-          data-add="${escapeHtml(
-            item.id
-          )}"
-          type="button"
-          aria-label="Ajouter ${escapeHtml(
-            item.name
-          )}"
-        >
-
-          <span>
-            +
-          </span>
-
-          Ajouter
-
-        </button>
-
-      </div>
+      <button
+        class="oi-add-btn"
+        data-add="${escapeHtml(item.id)}"
+        type="button"
+        aria-label="Ajouter ${escapeHtml(item.name)}"
+      >
+        <span aria-hidden="true">+</span>
+      </button>
 
     </article>
   `;
+}
+
+/**
+ * Filet de sécurité : si une product_images.public_url pointe vers
+ * une image cassée/introuvable (404, hébergement retiré...), on
+ * retire la vignette plutôt que de laisser l'icône d'image cassée
+ * du navigateur — jamais de placeholder visible, cassé ou non.
+ * Attaché en JS (pas d'attribut onerror inline, bloqué par la CSP
+ * script-src 'self').
+ */
+function hideBrokenProductImages() {
+  document
+    .querySelectorAll('.oi-card-media img, .product-photo')
+    .forEach(img => {
+      img.onerror = () => {
+        const media = img.closest('.oi-card-media');
+        const card = img.closest('.oi-card');
+
+        if (media) {
+          media.remove();
+          card?.classList.add('oi-card--no-photo');
+          return;
+        }
+
+        img.remove();
+      };
+    });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1257,12 +1272,40 @@ function setupCategorySpy() {
                 '[data-category]'
               )
               .forEach(button => {
+                const isActive =
+                  button.dataset.target ===
+                  slug;
+
                 button.classList.toggle(
                   'is-active',
-                  button.dataset
-                    .target ===
-                    slug
+                  isActive
                 );
+
+                if (isActive) {
+                  button.setAttribute(
+                    'aria-current',
+                    'true'
+                  );
+
+                  /*
+                   * La pastille active doit rester visible dans le
+                   * rail pendant que l'utilisateur défile la page :
+                   * inline:'center' la recentre horizontalement,
+                   * block:'nearest' évite tout scroll vertical
+                   * parasite (le rail défile sur son propre axe).
+                   */
+                  button.scrollIntoView({
+                    behavior: prefersReducedMotion()
+                      ? 'auto'
+                      : 'smooth',
+                    inline: 'center',
+                    block: 'nearest'
+                  });
+                } else {
+                  button.removeAttribute(
+                    'aria-current'
+                  );
+                }
               });
           }
         });
@@ -1336,9 +1379,40 @@ function bind() {
     )
     .forEach(button => {
       button.onclick = () =>
-        openProduct(
+        handleAddClick(
           button.dataset.add
         );
+    });
+
+  document
+    .querySelectorAll(
+      '[data-open]'
+    )
+    .forEach(card => {
+      card.onclick = () =>
+        openProduct(
+          card.dataset.open
+        );
+    });
+
+  hideBrokenProductImages();
+
+  document
+    .querySelectorAll(
+      '[data-order-mode]'
+    )
+    .forEach(button => {
+      button.onclick = () => {
+        orderMode = button.dataset.orderMode;
+
+        document
+          .querySelectorAll('[data-order-mode]')
+          .forEach(candidate => {
+            const isActive = candidate.dataset.orderMode === orderMode;
+            candidate.classList.toggle('is-active', isActive);
+            candidate.setAttribute('aria-pressed', String(isActive));
+          });
+      };
     });
 
   const openCartButton =
@@ -1351,6 +1425,16 @@ function bind() {
       openCart;
   }
 
+  const stickyCartButton =
+    document.querySelector(
+      '#sticky-cart-btn'
+    );
+
+  if (stickyCartButton) {
+    stickyCartButton.onclick =
+      openCart;
+  }
+
   const openAccountButton =
     document.querySelector(
       '#open-account'
@@ -1359,6 +1443,16 @@ function bind() {
   if (openAccountButton) {
     openAccountButton.onclick =
       openAccountModal;
+  }
+
+  const openInfoButton =
+    document.querySelector(
+      '#open-info'
+    );
+
+  if (openInfoButton) {
+    openInfoButton.onclick =
+      openInfoModal;
   }
 
   const closeCartButton =
@@ -1386,7 +1480,7 @@ function bind() {
 /* Product modal                                                              */
 /* -------------------------------------------------------------------------- */
 
-function openProduct(id) {
+function openProduct(id, editIndex = null) {
   const item =
     menu.find(
       product =>
@@ -1397,218 +1491,222 @@ function openProduct(id) {
     return;
   }
 
-  const meatField =
-    buildMeatField(item);
+  const existing =
+    editIndex !== null
+      ? cart[editIndex]
+      : null;
 
-  const sauceField =
-    buildSauceField(item);
+  const prefill = existing?.options || {};
 
-  const drinkField =
-    buildDrinkField(item);
+  const meatField = buildMeatField(item, prefill);
+  const sauceField = buildSauceField(item, prefill);
+  const drinkField = buildDrinkField(item, prefill);
 
-  document.querySelector(
-    '#modal-content'
-  ).innerHTML = `
+  const groups =
+    Array.isArray(item.options?.groups)
+      ? item.options.groups
+      : [];
 
-    <button
-      class="modal-close"
-      id="modal-close"
-      type="button"
-      aria-label="Fermer"
-    >
-      ×
-    </button>
+  const prefillGroups = Array.isArray(prefill.groups)
+    ? prefill.groups
+    : [];
 
-    ${
-      item.imageUrl
-        ? `
-          <img
-            class="product-photo"
-            src="${escapeHtml(
-              item.imageUrl
-            )}"
-            alt=""
-          >
-        `
-        : `
-          <div class="product-mark">
-            ${escapeHtml(
-              item.emoji
-            )}
+  const groupsField = groups
+    .map((g, gi) => {
+      const groupLabel = g.label || 'Choix';
+      const required = (g.min ?? 1) >= 1;
+      const selected =
+        prefillGroups.find((sel) => sel.label === groupLabel)?.choice ?? null;
+
+      return pillGroup({
+        name: `grp-${gi}`,
+        label: groupLabel,
+        options: (g.items || []).map(String),
+        selected,
+        required,
+        groupLabel
+      });
+    })
+    .join('');
+
+  let quantity = Math.max(1, Math.min(20, Number(existing?.quantity ?? 1)));
+
+  const ctaLabel = () =>
+    `${editIndex !== null ? 'Enregistrer' : 'Ajouter au panier'} · ${euro(item.price * quantity)}`;
+
+  document.querySelector('#modal-content').innerHTML = `
+
+    <button class="modal-close" id="modal-close" type="button" aria-label="Fermer">×</button>
+
+    <div class="oi-sheet-scroll">
+
+      ${
+        item.imageUrl
+          ? `<img class="product-photo" src="${escapeHtml(item.imageUrl)}" alt="">`
+          : ''
+      }
+
+      <p class="eyebrow">${escapeHtml(item.category)}</p>
+
+      <h2>${escapeHtml(item.name)}</h2>
+
+      ${item.description ? `<p class="oi-sheet-desc">${escapeHtml(item.description)}</p>` : ''}
+
+      <p class="oi-sheet-price">${euro(item.price)}</p>
+
+      <div class="oi-sheet-fields">
+
+        ${groupsField}
+
+        ${meatField}
+
+        ${sauceField}
+
+        ${drinkField}
+
+        <div class="oi-field">
+          <p class="oi-field-label">Quantité</p>
+          <div class="oi-stepper">
+            <button type="button" class="oi-stepper-btn" id="qty-minus" aria-label="Diminuer la quantité">−</button>
+            <span class="oi-stepper-value" id="qty-value" aria-live="polite">${quantity}</span>
+            <button type="button" class="oi-stepper-btn" id="qty-plus" aria-label="Augmenter la quantité">+</button>
           </div>
-        `
-    }
+        </div>
 
-    <p class="eyebrow">
-      ${escapeHtml(
-        item.category
-      )}
-    </p>
-
-    <h2>
-      ${escapeHtml(
-        item.name
-      )}
-    </h2>
-
-    ${
-      item.description
-        ? `
-          <p>
-            ${escapeHtml(
-              item.description
-            )}
-          </p>
-        `
-        : ''
-    }
-
-    <div class="form-grid">
-
-      ${meatField}
-
-      ${sauceField}
-
-      ${drinkField}
-
-      <label>
-        QUANTITÉ
-
-        <input
-          id="qty"
-          type="number"
-          min="1"
-          max="20"
-          value="1"
-          inputmode="numeric"
-        >
-      </label>
+      </div>
 
     </div>
 
-    <button
-      class="primary full"
-      id="confirm-add"
-      type="button"
-    >
-      Ajouter · ${euro(
-        item.price
-      )}
-    </button>
+    <div class="oi-sheet-cta">
+      <button class="primary full" id="confirm-add" type="button">
+        ${ctaLabel()}
+      </button>
+    </div>
   `;
 
-  document
-    .querySelector(
-      '#product-modal'
-    )
-    .classList.remove(
-      'hidden'
-    );
+  document.querySelector('#product-modal').classList.remove('hidden');
+  document.querySelector('#product-modal').classList.add('oi-sheet');
+  hideBrokenProductImages();
 
-  document.querySelector(
-    '#modal-close'
-  ).onclick = () => {
-    document
-      .querySelector(
-        '#product-modal'
-      )
-      .classList.add(
-        'hidden'
-      );
+  const ctaButton = document.querySelector('#confirm-add');
+
+  function refreshCta() {
+    ctaButton.textContent = ctaLabel();
+  }
+
+  document.querySelector('#modal-close').onclick = () => {
+    document.querySelector('#product-modal').classList.add('hidden');
+    document.querySelector('#product-modal').classList.remove('oi-sheet');
   };
 
-  document.querySelector(
-    '#confirm-add'
-  ).onclick = () => {
-    const quantity =
-      Math.max(
-        1,
-        Math.min(
-          20,
-          Number(
-            document.querySelector(
-              '#qty'
-            ).value || 1
-          )
-        )
-      );
+  const qtyValue = document.querySelector('#qty-value');
+  const qtyMinus = document.querySelector('#qty-minus');
+  const qtyPlus = document.querySelector('#qty-plus');
 
+  function syncQtyButtons() {
+    qtyMinus.disabled = quantity <= 1;
+    qtyPlus.disabled = quantity >= 20;
+  }
+
+  qtyMinus.onclick = () => {
+    quantity = Math.max(1, quantity - 1);
+    qtyValue.textContent = String(quantity);
+    syncQtyButtons();
+    refreshCta();
+  };
+
+  qtyPlus.onclick = () => {
+    quantity = Math.min(20, quantity + 1);
+    qtyValue.textContent = String(quantity);
+    syncQtyButtons();
+    refreshCta();
+  };
+
+  syncQtyButtons();
+
+  document
+    .querySelectorAll('#product-modal input[type="radio"]')
+    .forEach((input) => {
+      input.onchange = refreshCta;
+    });
+
+  ctaButton.onclick = () => {
     const options = {};
 
-    const meat1 =
-      document.querySelector(
-        '#meat-1'
-      )?.value;
-
-    const meat2 =
-      document.querySelector(
-        '#meat-2'
-      )?.value;
-
-    const meat3 =
-      document.querySelector(
-        '#meat-3'
-      )?.value;
-
-    const sauce =
-      document.querySelector(
-        '#sauce'
-      )?.value;
-
-    const drink =
-      document.querySelector(
-        '#drink'
-      )?.value;
+    const meat1 = document.querySelector('input[name="meat-1"]:checked')?.value;
+    const meat2 = document.querySelector('input[name="meat-2"]:checked')?.value;
+    const meat3 = document.querySelector('input[name="meat-3"]:checked')?.value;
+    const sauce = document.querySelector('input[name="sauce"]:checked')?.value;
+    const drink = document.querySelector('input[name="drink"]:checked')?.value;
 
     if (meat1) {
-      options.meat =
-        meat1;
+      options.meat = meat1;
     }
 
     if (meat2) {
-      options.meat2 =
-        meat2;
+      options.meat2 = meat2;
     }
 
     if (meat3) {
-      options.meat3 =
-        meat3;
+      options.meat3 = meat3;
     }
 
     if (meat2 || meat3) {
-      options.meats = [
-        meat1,
-        meat2,
-        meat3
-      ].filter(Boolean);
+      options.meats = [meat1, meat2, meat3].filter(Boolean);
     }
 
     if (sauce) {
-      options.sauce =
-        sauce;
+      options.sauce = sauce;
     }
 
     if (drink) {
-      options.drink =
-        drink;
+      options.drink = drink;
     }
 
-    cart = addItem(
-      cart,
-      {
-        ...item,
-        quantity,
-        options
-      }
-    );
+    let missingGroup = null;
+    const groupSelections = [];
 
-    document
-      .querySelector(
-        '#product-modal'
-      )
-      .classList.add(
-        'hidden'
+    groups.forEach((g, gi) => {
+      const groupLabel = g.label || 'Choix';
+      const required = (g.min ?? 1) >= 1;
+      const choice = document.querySelector(`input[name="grp-${gi}"]:checked`)?.value;
+
+      if (required && !choice && !missingGroup) {
+        missingGroup = groupLabel;
+      }
+
+      if (choice) {
+        groupSelections.push({ label: groupLabel, choice });
+      }
+    });
+
+    if (missingGroup) {
+      alert('Merci de choisir : ' + missingGroup);
+      return;
+    }
+
+    if (groupSelections.length) {
+      options.groups = groupSelections;
+    }
+
+    if (editIndex !== null) {
+      cart = cart.map((line, index) =>
+        index === editIndex ? { ...item, quantity, options } : line
       );
+
+      document.querySelector('#product-modal').classList.add('hidden');
+      document.querySelector('#product-modal').classList.remove('oi-sheet');
+
+      renderCart();
+      updateCartIndicators();
+
+      return;
+    }
+
+    cart = addItem(cart, { ...item, quantity, options });
+
+    document.querySelector('#product-modal').classList.add('hidden');
+    document.querySelector('#product-modal').classList.remove('oi-sheet');
 
     render();
     openCart();
@@ -1638,7 +1736,49 @@ function getOptionArray(
   return fallback;
 }
 
-function buildMeatField(item) {
+/**
+ * Groupe de choix présenté comme une rangée de pastilles
+ * sélectionnables (radio natif masqué, visuel en pastille) —
+ * remplace les anciens <select>, plus pénibles à utiliser au
+ * pouce. `required` sans `selected` laisse volontairement tout
+ * décoché (le client doit choisir activement, comme avant avec le
+ * <select vide "Choisir…">) ; sans `required`, la première option
+ * est cochée par défaut (comportement identique à l'ancien
+ * <select>, qui pré-sélectionnait déjà sa première <option>).
+ */
+function pillGroup({ name, label, options, selected = null, required = false }) {
+  if (!options.length) {
+    return '';
+  }
+
+  return `
+    <div class="oi-field">
+      <p class="oi-field-label">
+        ${escapeHtml(label)}
+        ${required ? '<span class="oi-field-required">Choix requis</span>' : ''}
+      </p>
+      <div class="oi-pill-group" role="radiogroup" aria-label="${escapeHtml(label)}">
+        ${options
+          .map((option, index) => {
+            const value = String(option);
+            const isChecked = selected != null
+              ? value === selected
+              : (!required && index === 0);
+
+            return `
+              <label class="oi-pill">
+                <input type="radio" name="${escapeHtml(name)}" value="${escapeHtml(value)}"${isChecked ? ' checked' : ''}>
+                <span>${escapeHtml(value)}</span>
+              </label>
+            `;
+          })
+          .join('')}
+      </div>
+    </div>
+  `;
+}
+
+function buildMeatField(item, prefill = {}) {
   if (!item.meat) {
     return '';
   }
@@ -1656,77 +1796,24 @@ function buildMeatField(item) {
     );
 
   if (item.tripleMeat) {
-    return `
-      <label>
-        VIANDE 1
-
-        <select id="meat-1">
-          ${optionsHtml(
-            options
-          )}
-        </select>
-      </label>
-
-      <label>
-        VIANDE 2
-
-        <select id="meat-2">
-          ${optionsHtml(
-            options
-          )}
-        </select>
-      </label>
-
-      <label>
-        VIANDE 3
-
-        <select id="meat-3">
-          ${optionsHtml(
-            options
-          )}
-        </select>
-      </label>
-    `;
+    return [
+      pillGroup({ name: 'meat-1', label: 'Viande 1', options, selected: prefill.meat ?? null }),
+      pillGroup({ name: 'meat-2', label: 'Viande 2', options, selected: prefill.meat2 ?? null }),
+      pillGroup({ name: 'meat-3', label: 'Viande 3', options, selected: prefill.meat3 ?? null })
+    ].join('');
   }
 
   if (item.multipleMeat) {
-    return `
-      <label>
-        VIANDE 1
-
-        <select id="meat-1">
-          ${optionsHtml(
-            options
-          )}
-        </select>
-      </label>
-
-      <label>
-        VIANDE 2
-
-        <select id="meat-2">
-          ${optionsHtml(
-            options
-          )}
-        </select>
-      </label>
-    `;
+    return [
+      pillGroup({ name: 'meat-1', label: 'Viande 1', options, selected: prefill.meat ?? null }),
+      pillGroup({ name: 'meat-2', label: 'Viande 2', options, selected: prefill.meat2 ?? null })
+    ].join('');
   }
 
-  return `
-    <label>
-      VIANDE
-
-      <select id="meat-1">
-        ${optionsHtml(
-          options
-        )}
-      </select>
-    </label>
-  `;
+  return pillGroup({ name: 'meat-1', label: 'Viande', options, selected: prefill.meat ?? null });
 }
 
-function buildSauceField(item) {
+function buildSauceField(item, prefill = {}) {
   if (!item.sauce) {
     return '';
   }
@@ -1741,20 +1828,10 @@ function buildSauceField(item) {
       SAUCES
     );
 
-  return `
-    <label>
-      SAUCE
-
-      <select id="sauce">
-        ${optionsHtml(
-          options
-        )}
-      </select>
-    </label>
-  `;
+  return pillGroup({ name: 'sauce', label: 'Sauce', options, selected: prefill.sauce ?? null });
 }
 
-function buildDrinkField(item) {
+function buildDrinkField(item, prefill = {}) {
   if (!item.drink) {
     return '';
   }
@@ -1771,30 +1848,7 @@ function buildDrinkField(item) {
       DRINKS
     );
 
-  return `
-    <label>
-      BOISSON
-
-      <select id="drink">
-        ${optionsHtml(
-          options
-        )}
-      </select>
-    </label>
-  `;
-}
-
-function optionsHtml(options) {
-  return options
-    .map(
-      option =>
-        `<option value="${escapeHtml(
-          option
-        )}">${escapeHtml(
-          option
-        )}</option>`
-    )
-    .join('');
+  return pillGroup({ name: 'drink', label: 'Boisson', options, selected: prefill.drink ?? null });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1802,6 +1856,8 @@ function optionsHtml(options) {
 /* -------------------------------------------------------------------------- */
 
 function openCart() {
+  cartStep = 'review';
+
   document
     .querySelector(
       '#drawer'
@@ -1821,6 +1877,72 @@ function openCart() {
   renderCart();
 }
 
+/**
+ * Ajout depuis la carte : direct si le produit n'a aucun choix à
+ * faire, sinon ouvre le configurateur (bottom sheet). N'ouvre pas
+ * le panier automatiquement (pour enchaîner plusieurs ajouts
+ * rapides) — seul l'ajout confirmé depuis le configurateur le fait,
+ * comportement déjà couvert par le test e2e existant.
+ */
+function handleAddClick(id) {
+  const item = menu.find(product => product.id === id);
+
+  if (!item) {
+    return;
+  }
+
+  if (!productNeedsOptions(item)) {
+    cart = addItem(cart, { ...item, quantity: 1, options: {} });
+    render();
+    return;
+  }
+
+  openProduct(id);
+}
+
+/**
+ * Met à jour le badge panier (header) et la barre sticky sans
+ * reconstruire toute la page — utilisé après une suppression /
+ * modification faite depuis le tiroir panier déjà ouvert, pour ne
+ * pas le refermer ni perdre le défilement de la carte en arrière-plan.
+ */
+function updateCartIndicators() {
+  const count = itemCount();
+
+  const badge = document.querySelector('#cart-badge');
+
+  if (badge) {
+    badge.textContent = String(count);
+    badge.classList.toggle('hidden', count === 0);
+  }
+
+  const openCartButton = document.querySelector('#open-cart');
+
+  if (openCartButton) {
+    openCartButton.setAttribute(
+      'aria-label',
+      `Panier, ${count} article${count > 1 ? 's' : ''}`
+    );
+  }
+
+  const stickyBar = document.querySelector('#sticky-cart-bar');
+
+  if (stickyBar) {
+    stickyBar.classList.toggle('hidden', cart.length === 0);
+
+    const countEl = stickyBar.querySelector('.oi-sticky-cart-count');
+    const totalEl = stickyBar.querySelector('.oi-sticky-cart-total');
+
+    if (countEl) {
+      countEl.textContent = `${count} article${count > 1 ? 's' : ''}`;
+    }
+
+    if (totalEl) {
+      totalEl.textContent = euro(calculateTotal(cart));
+    }
+  }
+}
+
 function closeCart() {
   document
     .querySelector(
@@ -1837,6 +1959,94 @@ function closeCart() {
     .classList.add(
       'hidden'
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Informations restaurant                                                    */
+/* -------------------------------------------------------------------------- */
+
+function openInfoModal() {
+  const displayName = getRestaurantDisplayName();
+  const address = getRestaurantAddress();
+  const phone = getRestaurantPhone();
+  const hours = formatOpeningHours(restaurant?.settings?.opening_hours);
+  const openNow = restaurantOpenNow();
+
+  let overlay = document.querySelector('#info-overlay');
+
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'info-overlay';
+    overlay.className = 'modal';
+    document.body.appendChild(overlay);
+
+    overlay.onclick = event => {
+      if (event.target === overlay) {
+        overlay.remove();
+      }
+    };
+  }
+
+  overlay.innerHTML = `
+    <div class="modal-card" id="info-content">
+
+      <button class="modal-close" id="info-close" type="button" aria-label="Fermer">×</button>
+
+      <p class="eyebrow">Informations</p>
+      <h2>${escapeHtml(displayName)}</h2>
+
+      <p class="oi-info-status">
+        <span class="oi-status-badge ${openNow ? 'is-open' : 'is-closed'}">
+          <span class="oi-status-dot"></span>
+          ${openNow ? 'Ouvert actuellement' : 'Fermé actuellement'}
+        </span>
+      </p>
+
+      ${address ? `<p class="oi-info-row">${escapeHtml(address)}</p>` : ''}
+
+      ${phone ? `<p class="oi-info-row"><a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></p>` : ''}
+
+      ${
+        hours.length
+          ? `
+            <div class="footer-hours oi-info-hours">
+              ${hours
+                .map(
+                  line => `
+                    <span>
+                      ${escapeHtml(line.label)}
+                      <b>${escapeHtml(line.hours)}</b>
+                    </span>
+                  `
+                )
+                .join('')}
+            </div>
+          `
+          : ''
+      }
+
+      ${
+        restaurant?.settings?.delivery_mode === 'redirect' &&
+        restaurant?.settings?.delivery_redirect_url
+          ? `
+            <a
+              class="secondary full oi-info-delivery"
+              href="${escapeHtml(restaurant.settings.delivery_redirect_url)}"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Livraison via Uber Eats →
+            </a>
+          `
+          : ''
+      }
+
+    </div>
+  `;
+
+  overlay.querySelector('#info-close').onclick = () => {
+    overlay.remove();
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1910,6 +2120,26 @@ async function loadAccountDashboard() {
 
   accountOrders = orders;
   accountConsents = consents;
+
+  try {
+    const program = await getLoyaltyProgram(supabase, restaurant.id);
+    if (program?.is_active) {
+      const [account, rewards] = await Promise.all([
+        getMyLoyaltyAccount(supabase, restaurant.id),
+        getLoyaltyRewards(supabase, restaurant.id)
+      ]);
+      loyaltyAccount = account;
+      loyaltyRewardsAvailable = rewards.filter((r) => r.is_active);
+    } else {
+      loyaltyAccount = null;
+      loyaltyRewardsAvailable = [];
+    }
+  } catch (err) {
+    console.error('[FOODATOI] Erreur chargement fidélité:', err);
+    loyaltyAccount = null;
+    loyaltyRewardsAvailable = [];
+  }
+
   accountView = 'dashboard';
 }
 
@@ -1981,6 +2211,43 @@ function renderAccountContent() {
             : `<p class="muted">Aucune commande pour le moment.</p>`
         }
       </div>
+
+      ${
+        loyaltyAccount || loyaltyRewardsAvailable.length
+          ? `
+            <div class="account-section">
+              <h3>Ma fidélité</h3>
+              <p class="loyalty-balance">${loyaltyAccount?.balance_points ?? 0} points</p>
+              ${
+                loyaltyRewardsAvailable.length
+                  ? `<ul class="account-orders loyalty-rewards">
+                      ${loyaltyRewardsAvailable
+                        .map(
+                          (reward) => `
+                            <li>
+                              <div>
+                                <strong>${escapeHtml(reward.name)}</strong>
+                                ${reward.description ? `<span>${escapeHtml(reward.description)}</span>` : ''}
+                              </div>
+                              <button
+                                class="secondary small"
+                                data-redeem-reward="${reward.id}"
+                                type="button"
+                                ${(loyaltyAccount?.balance_points ?? 0) < reward.cost_points || loyaltyRedeeming ? 'disabled' : ''}
+                              >
+                                ${reward.cost_points} pts
+                              </button>
+                            </li>
+                          `
+                        )
+                        .join('')}
+                    </ul>`
+                  : `<p class="muted">Aucune récompense disponible pour le moment.</p>`
+              }
+            </div>
+          `
+          : ''
+      }
 
       <div class="account-section">
         <h3>Communications</h3>
@@ -2200,6 +2467,29 @@ function bindAccountDashboardEvents() {
     };
   }
 
+  document.querySelectorAll('[data-redeem-reward]').forEach((button) => {
+    button.onclick = async () => {
+      if (loyaltyRedeeming) {
+        return;
+      }
+
+      loyaltyRedeeming = true;
+      renderAccountContent();
+
+      try {
+        await redeemLoyaltyReward(supabase, button.dataset.redeemReward);
+        loyaltyAccount = await getMyLoyaltyAccount(supabase, restaurant.id);
+        alert('Récompense échangée ! Montre cet écran en caisse pour en profiter.');
+      } catch (err) {
+        console.error('[FOODATOI] Erreur échange récompense:', err);
+        alert('Impossible d’échanger cette récompense pour le moment.');
+      } finally {
+        loyaltyRedeeming = false;
+        renderAccountContent();
+      }
+    };
+  });
+
   ['EMAIL', 'SMS'].forEach(channel => {
     const input = document.querySelector(
       `#consent-${channel.toLowerCase()}`
@@ -2289,6 +2579,46 @@ function bindAccountDashboardEvents() {
   }
 }
 
+/**
+ * Repère léger "1 Panier · 2 Coordonnées" au-dessus du contenu du
+ * tiroir — pas un stepper façon SaaS, juste de quoi situer l'étape
+ * en cours. N'affiche rien si le panier est vide (rien à situer).
+ */
+function renderCartSteps() {
+  const stepsElement =
+    document.querySelector(
+      '#cart-steps'
+    );
+
+  if (!stepsElement) {
+    return;
+  }
+
+  if (!cart.length) {
+    stepsElement.innerHTML = '';
+    return;
+  }
+
+  const onDetails = cartStep === 'details';
+
+  stepsElement.innerHTML = `
+    <ol class="oi-steps" role="list">
+      <li class="oi-step${onDetails ? ' is-done' : ' is-active'}"${
+        onDetails ? '' : ' aria-current="step"'
+      }>
+        <span class="oi-step-num">${onDetails ? '✓' : '1'}</span>
+        Panier
+      </li>
+      <li class="oi-step${onDetails ? ' is-active' : ''}"${
+        onDetails ? ' aria-current="step"' : ''
+      }>
+        <span class="oi-step-num">2</span>
+        Coordonnées
+      </li>
+    </ol>
+  `;
+}
+
 function renderCart() {
   const element =
     document.querySelector(
@@ -2299,7 +2629,11 @@ function renderCart() {
     return;
   }
 
+  renderCartSteps();
+
   if (!cart.length) {
+    cartStep = 'review';
+
     element.innerHTML = `
       <div class="empty-ticket">
 
@@ -2308,7 +2642,7 @@ function renderCart() {
         </div>
 
         <h3>
-          Ton ticket est vide.
+          Ton panier est vide.
         </h3>
 
         <p>
@@ -2335,115 +2669,92 @@ function renderCart() {
     return;
   }
 
+  if (cartStep === 'details') {
+    renderCartDetails(element);
+    return;
+  }
+
+  renderCartReview(element);
+}
+
+function renderCartReview(element) {
+  const subtotal = calculateTotal(cart);
+  const cartEtaLabel = getCartEtaLabel();
+
   element.innerHTML = `
-    <div class="ticket-paper">
+    <p class="eyebrow oi-review-eyebrow">Ta commande</p>
 
-      <div class="ticket-header">
-
-        <span>
-          ${escapeHtml(
-            getRestaurantDisplayName()
-          )}
-        </span>
-
-        <span>
-          COMMANDE
-        </span>
-
-      </div>
-
-      <div class="ticket-items">
-
-        ${cart
-          .map(
-            (
-              item,
-              index
-            ) =>
-              ticketItem(
-                item,
-                index
-              )
-          )
-          .join('')}
-
-      </div>
-
-      <div class="ticket-total">
-
-        <span>
-          TOTAL
-        </span>
-
-        <strong>
-          ${euro(
-            calculateTotal(
-              cart
-            )
-          )}
-        </strong>
-
-      </div>
-
-      <div class="ticket-note">
-
-        <strong>
-          RETRAIT SUR PLACE
-        </strong>
-
-        ${
-          getRestaurantAddress()
-            ? `
-              <span>
-                ${escapeHtml(
-                  getRestaurantAddress()
-                )}
-              </span>
-            `
-            : ''
-        }
-
-        <small>
-          Paiement au restaurant
-        </small>
-
-      </div>
-
+    <div class="oi-cart-items">
+      ${cart
+        .map((item, index) => ticketItem(item, index))
+        .join('')}
     </div>
 
-    ${
-      !isRestaurantOpen(
-        restaurant?.settings
-          ?.opening_hours
-      )
-        ? `
-          <div class="closed-banner">
-            <p class="eyebrow">
-              FERMÉ ACTUELLEMENT
-            </p>
-            <p>
-              ${escapeHtml(
-                getRestaurantDisplayName()
-              )}
-              n'accepte pas de commande en dehors de ses horaires d'ouverture.
-              Reviens plus tard pour commander.
-            </p>
-          </div>
-        `
-        : ''
-    }
+    <div class="oi-cart-totals">
+      <div class="oi-cart-total-row">
+        <span>Sous-total</span>
+        <span>${euro(subtotal)}</span>
+      </div>
+      <div class="oi-cart-total-row oi-cart-total-row--grand">
+        <span>Total</span>
+        <strong>${euro(subtotal)}</strong>
+      </div>
+    </div>
+
+    ${cartEtaLabel ? `<p class="oi-cart-estimate">${escapeHtml(cartEtaLabel)}</p>` : ''}
+
+    <div class="oi-sheet-cta">
+      <button class="primary full" id="cart-continue" type="button">
+        Continuer · ${euro(subtotal)}
+      </button>
+    </div>
+  `;
+
+  element.querySelectorAll('[data-remove]').forEach(button => {
+    button.onclick = () => {
+      cart.splice(Number(button.dataset.remove), 1);
+      renderCart();
+      updateCartIndicators();
+    };
+  });
+
+  element.querySelectorAll('[data-edit]').forEach(button => {
+    button.onclick = () => {
+      openProduct(button.dataset.editId, Number(button.dataset.edit));
+    };
+  });
+
+  const continueButton = element.querySelector('#cart-continue');
+
+  if (continueButton) {
+    continueButton.onclick = () => {
+      cartStep = 'details';
+      renderCart();
+    };
+  }
+}
+
+function renderCartDetails(element) {
+  const subtotal = calculateTotal(cart);
+
+  element.innerHTML = `
+    <button type="button" id="cart-back" class="oi-back-link">
+      ${ICONS.chevronLeft} Retour au panier
+    </button>
+
+    <div id="hours-banner"></div>
 
     <form
       id="order-form"
-      class="order-form"
+      class="order-form oi-checkout-form"
     >
 
       <p class="eyebrow">
-        DERNIÈRE ÉTAPE
+        Vos coordonnées
       </p>
 
       <label>
-        TON NOM
+        Ton nom
 
         <input
           name="name"
@@ -2454,7 +2765,7 @@ function renderCart() {
       </label>
 
       <label>
-        TON TÉLÉPHONE
+        Ton téléphone
 
         <input
           name="phone"
@@ -2466,17 +2777,135 @@ function renderCart() {
       </label>
 
       <label>
-        HEURE SOUHAITÉE
+        Email (facultatif)
 
         <input
-          name="pickupTime"
-          type="time"
-          required
+          name="email"
+          type="email"
+          id="email-field"
+          placeholder="toi@exemple.fr"
+          autocomplete="email"
         >
       </label>
 
+      <p class="eyebrow oi-form-section">
+        Mode de commande
+      </p>
+
+      <p class="oi-mode-readout">
+        ${ICONS.cart}
+        <span><span class="oi-mode-readout-label">Mode</span> ${
+          orderMode === 'onsite' ? 'Sur place' : 'À emporter'
+        }</span>
+      </p>
+
+      ${
+        restaurant?.settings?.delivery_mode === 'internal'
+          ? `
+            <div class="oi-segmented oi-segmented--radio fulfillment-toggle" role="radiogroup" aria-label="Mode de récupération">
+
+              <label class="oi-segmented-radio">
+                <input
+                  type="radio"
+                  name="fulfillmentType"
+                  value="PICKUP"
+                  checked
+                >
+                <span>Retrait sur place</span>
+              </label>
+
+              <label class="oi-segmented-radio">
+                <input
+                  type="radio"
+                  name="fulfillmentType"
+                  value="DELIVERY"
+                >
+                <span>Livraison</span>
+              </label>
+
+            </div>
+
+            <div
+              id="delivery-address-fields"
+              class="delivery-address-fields"
+              hidden
+            >
+
+              <label>
+                Adresse
+
+                <input
+                  name="deliveryStreet"
+                  placeholder="12 rue des Fleurs"
+                  autocomplete="street-address"
+                >
+              </label>
+
+              <label>
+                Code postal
+
+                <input
+                  name="deliveryPostalCode"
+                  placeholder="31000"
+                  inputmode="numeric"
+                  autocomplete="postal-code"
+                >
+              </label>
+
+              <label>
+                Ville
+
+                <input
+                  name="deliveryCity"
+                  placeholder="Toulouse"
+                  autocomplete="address-level2"
+                >
+              </label>
+
+              <label>
+                Complément (bâtiment, étage, code portail...)
+
+                <input
+                  name="deliveryComplement"
+                  placeholder="Facultatif"
+                >
+              </label>
+
+            </div>
+          `
+          : ''
+      }
+
+      <p class="eyebrow oi-form-section">
+        Créneau
+      </p>
+
+      <div class="oi-slot-grid">
+        <label id="pickup-date-label">
+          <span>Jour de retrait</span>
+
+          <input
+            name="pickupDate"
+            type="date"
+            id="pickup-date"
+            required
+          >
+        </label>
+
+        <label>
+          <span>Heure souhaitée</span>
+
+          <input
+            name="pickupTime"
+            type="time"
+            id="pickup-time"
+            required
+          >
+        </label>
+      </div>
+
       <label>
-        DEMANDE SPÉCIALE (facultatif)
+        Demande spéciale (facultatif)
 
         <textarea
           name="specialInstructions"
@@ -2486,50 +2915,44 @@ function renderCart() {
         ></textarea>
       </label>
 
-      <button
-        class="primary full"
-        type="submit"
-        ${
-          !isRestaurantOpen(
-            restaurant?.settings
-              ?.opening_hours
-          )
-            ? 'disabled'
-            : ''
-        }
-      >
-        Envoyer ma commande →
-      </button>
+      <div class="oi-payment-note">
+        <p class="oi-payment-note-title">Paiement au restaurant</p>
+        <p class="oi-payment-note-sub">Aucun paiement en ligne pour le moment.</p>
+      </div>
 
-      <small>
-        ${
-          remoteStore
-            ? `Commande transmise directement à l’espace ${escapeHtml(
-                getRestaurantDisplayName()
-              )}.`
-            : 'Mode démo : aucune commande réelle n’est envoyée.'
-        }
-      </small>
+      <div class="oi-sheet-cta">
+        <button
+          class="primary full"
+          type="submit"
+          id="submit-order"
+        >
+          Commander · ${euro(subtotal)}
+        </button>
+
+        <p class="oi-sheet-cta-status" id="submit-status" aria-live="polite"></p>
+
+        <small>
+          ${
+            remoteStore
+              ? `Commande transmise directement à l’espace ${escapeHtml(
+                  getRestaurantDisplayName()
+                )}.`
+              : 'Mode démo : aucune commande réelle n’est envoyée.'
+          }
+        </small>
+      </div>
 
     </form>
   `;
 
-  element
-    .querySelectorAll(
-      '[data-remove]'
-    )
-    .forEach(button => {
-      button.onclick = () => {
-        cart.splice(
-          Number(
-            button.dataset.remove
-          ),
-          1
-        );
+  const backButton = element.querySelector('#cart-back');
 
-        renderCart();
-      };
-    });
+  if (backButton) {
+    backButton.onclick = () => {
+      cartStep = 'review';
+      renderCart();
+    };
+  }
 
   const form =
     element.querySelector(
@@ -2537,17 +2960,119 @@ function renderCart() {
     );
 
   if (form) {
+    const dateInput = form.querySelector('#pickup-date');
+    const timeInput = form.querySelector('#pickup-time');
+    const banner = element.querySelector('#hours-banner');
+    const submitButton = form.querySelector('#submit-order');
+
+    const fulfillmentInputs = form.querySelectorAll('input[name="fulfillmentType"]');
+    const deliveryFields = element.querySelector('#delivery-address-fields');
+    const pickupDateLabel = form.querySelector('#pickup-date-label span');
+
+    function updateFulfillmentState() {
+      if (!fulfillmentInputs.length) {
+        return;
+      }
+
+      const isDelivery =
+        form.querySelector('input[name="fulfillmentType"]:checked')?.value === 'DELIVERY';
+
+      if (deliveryFields) {
+        const wasHidden = deliveryFields.hidden;
+
+        deliveryFields.hidden = !isDelivery;
+
+        deliveryFields.querySelectorAll('input').forEach(input => {
+          input.required = isDelivery && input.name !== 'deliveryComplement';
+        });
+
+        /*
+         * Petite transition d'apparition (120-220ms, cohérente avec
+         * le reste du Bloc 2) uniquement quand les champs passent de
+         * masqués à visibles — l'attribut `hidden` reste la source
+         * de vérité pour l'accessibilité (focus/lecture d'écran),
+         * l'animation est purement décorative.
+         */
+        if (isDelivery && wasHidden) {
+          deliveryFields.classList.remove('oi-fade-in');
+          void deliveryFields.offsetWidth;
+          deliveryFields.classList.add('oi-fade-in');
+        }
+      }
+
+      if (pickupDateLabel) {
+        pickupDateLabel.textContent = isDelivery
+          ? 'Jour de livraison'
+          : 'Jour de retrait';
+      }
+    }
+
+    fulfillmentInputs.forEach(input => {
+      input.onchange = updateFulfillmentState;
+    });
+
+    updateFulfillmentState();
+
+    const todayIso = new Date().toLocaleDateString('en-CA');
+    const maxDate = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA');
+
+    dateInput.min = todayIso;
+    dateInput.max = maxDate;
+    dateInput.value = todayIso;
+
+    function selectedInstant() {
+      const iso = parisTimeToIsoDate(
+        timeInput.value,
+        dateInput.value
+      );
+      return iso ? new Date(iso) : null;
+    }
+
+    function updateHoursState() {
+      const instant = selectedInstant();
+
+      const open =
+        instant &&
+        isRestaurantOpen(
+          restaurant?.settings?.opening_hours,
+          instant
+        );
+
+      submitButton.disabled = !open;
+
+      banner.innerHTML = open
+        ? ''
+        : `
+          <div class="closed-banner oi-closed-banner oi-closed-banner--compact">
+            <p class="eyebrow">Fermé à ce créneau</p>
+            <p>
+              ${escapeHtml(getRestaurantDisplayName())} n'accepte pas de
+              commande à cet horaire. Choisis un autre jour ou une autre heure.
+            </p>
+          </div>
+        `;
+    }
+
+    dateInput.onchange = updateHoursState;
+    timeInput.onchange = updateHoursState;
+    updateHoursState();
+
+    const emailField = form.querySelector('#email-field');
+
     form.onsubmit =
       async event => {
         event.preventDefault();
 
+        const instant = selectedInstant();
+
         if (
+          !instant ||
           !isRestaurantOpen(
-            restaurant?.settings
-              ?.opening_hours
+            restaurant?.settings?.opening_hours,
+            instant
           )
         ) {
-          renderCart();
+          updateHoursState();
           return;
         }
 
@@ -2558,21 +3083,57 @@ function renderCart() {
             )
           );
 
+        const email = String(formData.email || '').trim();
+
+        if (email && !isValidEmail(email)) {
+          emailField?.setCustomValidity('Adresse email invalide.');
+          emailField?.reportValidity();
+          return;
+        }
+
+        emailField?.setCustomValidity('');
+
         const order =
           createOrder(
             cart,
             formData
           );
 
-        order.notes =
+        /*
+         * Ni "sur place" ni l'email n'ont de colonne dédiée côté
+         * données (create_order n'en attend pas) : reportés dans
+         * les notes, déjà lues par le comptoir, plutôt que
+         * silencieusement perdus.
+         */
+        const noteParts = [];
+
+        if (orderMode === 'onsite') {
+          noteParts.push('Sur place');
+        }
+
+        if (email) {
+          noteParts.push(`Email : ${email}`);
+        }
+
+        const specialInstructions =
           String(
             formData.specialInstructions ||
               ''
-          ).trim() || null;
+          ).trim();
+
+        if (specialInstructions) {
+          noteParts.push(specialInstructions);
+        }
+
+        order.notes =
+          noteParts.join(' — ').slice(0, 500) || null;
 
         if (!checkoutIdempotencyKey) {
           checkoutIdempotencyKey =
             crypto.randomUUID();
+          persistIdempotencyKey(
+            checkoutIdempotencyKey
+          );
         }
 
         order.idempotencyKey =
@@ -2599,45 +3160,31 @@ function ticketItem(
     );
 
   return `
-    <div class="ticket-item">
+    <div class="oi-cart-item">
 
-      <div>
+      <div class="oi-cart-item-main">
 
-        <strong>
-          ${item.quantity} ×
-          ${escapeHtml(
-            item.name
-          )}
-        </strong>
+        <div class="oi-cart-item-title">
+          <span class="oi-cart-item-qty">${item.quantity}×</span>
+          <strong class="oi-cart-item-name">${escapeHtml(item.name)}</strong>
+        </div>
 
-        ${
-          options
-            ? `
-              <span>
-                ${escapeHtml(
-                  options
-                )}
-              </span>
-            `
-            : ''
-        }
+        ${options ? `<span class="oi-cart-item-options">${escapeHtml(options)}</span>` : ''}
+
+        <div class="oi-cart-item-actions">
+          <button data-edit="${index}" data-edit-id="${escapeHtml(item.id)}" type="button">
+            Modifier
+          </button>
+          <button data-remove="${index}" type="button">
+            Supprimer
+          </button>
+        </div>
 
       </div>
 
       <b>
-        ${euro(
-          item.price *
-            item.quantity
-        )}
+        ${euro(item.price * item.quantity)}
       </b>
-
-      <button
-        data-remove="${index}"
-        type="button"
-        aria-label="Supprimer"
-      >
-        ×
-      </button>
 
     </div>
   `;
@@ -2686,6 +3233,14 @@ function formatOptions(
     );
   }
 
+  if (Array.isArray(options.groups)) {
+    options.groups.forEach((g) => {
+      if (g && g.label && g.choice) {
+        parts.push(`${g.label} : ${g.choice}`);
+      }
+    });
+  }
+
   return parts.join(
     ' · '
   );
@@ -2698,6 +3253,31 @@ function formatOptions(
 async function submitOrder(
   order
 ) {
+  /*
+   * Verrou logique : seule source de vérité pour empêcher un double
+   * envoi. `submitButton.disabled` reste un effet visuel de cet état,
+   * jamais l'inverse.
+   */
+  if (orderSubmitting) {
+    return;
+  }
+
+  orderSubmitting = true;
+
+  const submitButton = document.querySelector('#submit-order');
+  const submitStatus = document.querySelector('#submit-status');
+  const originalButtonLabel = submitButton?.innerHTML ?? '';
+
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.setAttribute('aria-busy', 'true');
+    submitButton.innerHTML = '<span class="oi-btn-spinner" aria-hidden="true"></span>Envoi…';
+  }
+
+  if (submitStatus) {
+    submitStatus.textContent = 'Envoi de la commande en cours…';
+  }
+
   try {
     let saved;
 
@@ -2751,6 +3331,25 @@ async function submitOrder(
 
     cart = [];
     checkoutIdempotencyKey = null;
+    persistIdempotencyKey(null);
+
+    /*
+     * Succès : on relâche le verrou tout de suite — l'écran de
+     * confirmation remplace le formulaire, mais l'état module-level
+     * doit déjà être cohérent pour qu'une commande suivante (après
+     * "Terminé", qui ré-affiche un formulaire neuf) puisse repartir.
+     */
+    orderSubmitting = false;
+
+    /*
+     * Synchronise le badge panier (header) et la barre sticky tout
+     * de suite, sans attendre le clic sur "Terminé" (qui ne
+     * survient qu'au render() complet dans showConfirmation) : entre
+     * les deux, la commande vient d'être confirmée mais l'UI panier
+     * affichait encore l'ancien total. `saved` (la commande déjà
+     * envoyée) n'est pas concerné, seul l'état panier local l'est.
+     */
+    updateCartIndicators();
 
     showConfirmation(
       saved
@@ -2779,6 +3378,23 @@ async function submitOrder(
         ? 'Trop de commandes envoyées récemment avec ce numéro. Réessaie dans quelques minutes.'
         : 'Impossible d’envoyer la commande pour le moment.'
     );
+
+    /*
+     * Échec : on ne touche ni au panier ni aux champs déjà remplis
+     * (le formulaire n'est pas re-rendu ici), on relâche le verrou
+     * et on rétablit le bouton pour permettre un nouvel essai.
+     */
+    orderSubmitting = false;
+
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.removeAttribute('aria-busy');
+      submitButton.innerHTML = originalButtonLabel;
+    }
+
+    if (submitStatus) {
+      submitStatus.textContent = '';
+    }
   }
 }
 
@@ -2794,42 +3410,71 @@ function showConfirmation(
       order
     );
 
+  /*
+   * `order.type` ('PICKUP' / 'DELIVERY') est calculé une seule fois,
+   * de façon déterministe, par createOrder() (orderLogic.mjs) à
+   * partir du radio "Retrait sur place / Livraison" réellement
+   * soumis — jamais deviné ici. 'DELIVERY' n'est possible que quand
+   * la livraison interne était proposée et explicitement choisie ;
+   * dans tous les autres cas (pas de livraison interne, ou "Retrait
+   * sur place" choisi) le libellé retombe sur le mode de commande
+   * (onsite/à emporter), déjà fiable et déjà affiché juste au-dessus.
+   */
+  const isInternalDelivery = order?.type === 'DELIVERY';
+  const slotLabel = isInternalDelivery
+    ? 'Livraison'
+    : orderMode === 'onsite'
+    ? 'Heure'
+    : 'Retrait';
+
   closeCart();
 
   document.querySelector(
     '#modal-content'
   ).innerHTML = `
-    <div class="confirmation">
+    <div class="confirmation oi-confirmation">
 
       <div class="confirmed-stamp">
         ✓
       </div>
 
       <p class="eyebrow">
-        COMMANDE ENREGISTRÉE
+        Commande envoyée
       </p>
 
-      <h2>
+      <h2 class="oi-confirmation-number">
         ${escapeHtml(
           ticket.number
         )}
       </h2>
 
       <p>
-        Ton ticket est parti chez
+        Commande envoyée à
         <strong>
           ${escapeHtml(
             getRestaurantDisplayName()
           )}
         </strong>.
-
-        Retrait souhaité à
-        <strong>
-          ${escapeHtml(
-            ticket.pickup
-          )}
-        </strong>.
       </p>
+
+      <div class="oi-confirmation-summary">
+
+        <div class="oi-confirmation-row">
+          <span>Mode</span>
+          <strong>${orderMode === 'onsite' ? 'Sur place' : 'À emporter'}</strong>
+        </div>
+
+        <div class="oi-confirmation-row">
+          <span>${escapeHtml(slotLabel)}</span>
+          <strong>${escapeHtml(ticket.pickup)}</strong>
+        </div>
+
+        <div class="oi-confirmation-row oi-confirmation-row--total">
+          <span>Total</span>
+          <strong>${escapeHtml(ticket.totalLabel)}</strong>
+        </div>
+
+      </div>
 
       <div class="ticket-paper compact">
 
@@ -2921,6 +3566,10 @@ function showConfirmation(
 
 async function bootstrap() {
   try {
+    // Mesure d'audience anonyme, tout au début (capture aussi ?src=... avant
+    // toute redirection). Best-effort, ne bloque rien.
+    trackPageview();
+
     renderLoading();
 
     /**

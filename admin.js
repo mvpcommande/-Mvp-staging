@@ -9,14 +9,59 @@ import {
   aggregateOrderItems,
   buildStockSummaryCsv,
   printStockSummary,
-  calculateUberEatsSavings
+  calculateUberEatsSavings,
+  filterOrdersByDateRange,
+  buildAccountingCsv
 } from './adminFeatures.mjs';
 import { resolveRestaurant } from './restaurantResolver.mjs';
 import { formatPickupTime } from './timeFormat.mjs';
-import { logClientError } from './errorLog.mjs';
+import ReceiptPrinterEncoder from '@point-of-sale/receipt-printer-encoder';
+import WebUSBReceiptPrinter from '@point-of-sale/webusb-receipt-printer';
+import {
+  isThermalPrinterSupported,
+  buildReceiptBytes,
+  createThermalPrinterController
+} from './thermalPrinter.mjs';
+import {
+  logClientError,
+  installGlobalErrorLogging
+} from './errorLog.mjs';
 import { escapeHtml } from './htmlEscape.mjs';
+import { createRealtimeConnectionManager } from './realtimeResilience.mjs';
 import './styles.css';
 const root = document.querySelector('#admin-root');
+
+/*
+ * Imprimante thermique réelle : uniquement là où WebUSB existe
+ * (Chrome/Edge). Sur Safari/iOS, isThermalPrinterSupported() est
+ * false, le bouton reste caché, et printOrderSmart() retombe sur le
+ * dialogue navigateur existant sans que rien d'autre ne change.
+ */
+const thermalPrinter = isThermalPrinterSupported()
+  ? createThermalPrinterController(WebUSBReceiptPrinter)
+  : null;
+
+if (thermalPrinter) {
+  thermalPrinter.tryAutoReconnect();
+}
+
+function printOrderSmart(order, restaurantName) {
+  if (thermalPrinter?.isConnected()) {
+    try {
+      const bytes = buildReceiptBytes(order, ReceiptPrinterEncoder, {
+        restaurantName,
+        language: thermalPrinter.getDeviceInfo()?.language || 'esc-pos',
+        codepageMapping: thermalPrinter.getDeviceInfo()?.codepageMapping
+      });
+      thermalPrinter.printBytes(bytes);
+      return;
+    } catch (err) {
+      console.error('[FOODATOI admin] Échec impression thermique, repli navigateur:', err);
+    }
+  }
+  printOrder(order, undefined, restaurantName);
+}
+
 const labels = {
   NEW: 'Nouvelle',
   ACCEPTED: 'Acceptée',
@@ -24,11 +69,169 @@ const labels = {
   READY: 'Prête',
   CANCELLED: 'Annulée'
 };
+const deliveryLabels = {
+  TO_DELIVER: 'À livrer',
+  DELIVERED: 'Livrée'
+};
 let remote = null;
 let mode = 'local';
-let realtimeChannel = null;
 let session = null;
 let restaurant = null;
+
+/*
+ * Bloc 5.4 : le canal Realtime n'est plus créé/reconnecté "à la main"
+ * ici. realtimeResilience.mjs porte l'invariant "au plus un channel
+ * actif, au plus une reconnexion planifiée à la fois" (généralisé par
+ * un compteur de génération), le backoff borné, le polling de secours
+ * et la reprise Safari/iOS -- ce fichier ne garde que le câblage vers
+ * le vrai client Supabase et le rendu.
+ *
+ * Instance unique créée au chargement du module : ses callbacks
+ * relisent `session`/`restaurant`/`mode` à chaque appel (fermetures sur
+ * ces `let` mutables), donc un seul gestionnaire suffit pour tout le
+ * cycle de vie connexion/déconnexion/reconnexion du comptoir.
+ */
+const realtimeManager = createRealtimeConnectionManager({
+  subscribe: (onMessage, onStatusChange) =>
+    subscribeToOrderChanges(supabase, onMessage, onStatusChange),
+  unsubscribe: async (channel) => {
+    if (supabase) {
+      await supabase.removeChannel(channel);
+    }
+  },
+  setAuth: async () => {
+    if (supabase && session?.access_token) {
+      await supabase.realtime.setAuth(session.access_token);
+    }
+  },
+  onMessage: (payload) => {
+    if (payload?.eventType === 'INSERT') {
+      showNewOrderToast();
+    }
+    render();
+  },
+  onStatusChange: (status) => {
+    updateConnectionBadge();
+    if (status === 'reconnecting') {
+      logRealtimeDrop();
+    }
+  },
+  onPoll: () => render(),
+  isActive: () => mode === 'remote'
+});
+
+/*
+ * Anti-flood dédié aux logs "admin.realtime" : ceux-ci passent par un
+ * appel direct à logClientError() (pas par le filet console.error /
+ * window.onerror de errorLog.mjs, qui a son propre dédoublonnage 10s),
+ * car ils portent un contexte/restaurantId précis. Sans ça, une rafale de CLOSED (même
+ * dédupliquée côté connexion par realtimeResilience.mjs) continuerait
+ * de produire une ligne par transition d'état -- observé en prod
+ * (38 entrées "admin.realtime" pour un seul épisode d'instabilité).
+ */
+let lastRealtimeLogAt = 0;
+let realtimeLogSuppressedCount = 0;
+const REALTIME_LOG_DEDUPE_MS = 15000;
+
+function logRealtimeDrop() {
+  const now = Date.now();
+  if (now - lastRealtimeLogAt < REALTIME_LOG_DEDUPE_MS) {
+    realtimeLogSuppressedCount += 1;
+    return;
+  }
+  lastRealtimeLogAt = now;
+  const suppressed = realtimeLogSuppressedCount;
+  realtimeLogSuppressedCount = 0;
+  logClientError(supabase, {
+    restaurantId: restaurant?.id,
+    context: 'admin.realtime',
+    message:
+      'Canal realtime perdu, reconnexion programmée' +
+      (suppressed > 0
+        ? ` (+${suppressed} occurrence(s) similaire(s) supprimée(s) dans les 15s précédentes)`
+        : ''),
+    page: 'admin'
+  });
+}
+
+/*
+ * Onglet actif sur mobile (<768px), où les 4 colonnes ne peuvent pas
+ * être visibles simultanément. Conservé en dehors de render() pour
+ * survivre à un re-render déclenché par un événement Realtime pendant
+ * que le comptoir consulte un autre onglet.
+ */
+let activeMobileTab = 'NEW';
+
+let toastTimeout = null;
+let ageTickerHandle = null;
+
+/*
+ * Verrous anti double-clic : id de commande en cours de mise à jour,
+ * indépendants de l'attribut `disabled` du bouton (qui est reconstruit
+ * à chaque render()).
+ */
+const pendingStatusChanges = new Set();
+const pendingDeliveryChanges = new Set();
+
+/*
+ * Les 4 statuts réellement actionnables par le comptoir (voir
+ * orderWorkflow.mjs). CANCELLED existe côté base (cf. policy RLS)
+ * mais n'a aucune transition cliquable ici — les commandes dans cet
+ * état restent visibles à part, jamais mélangées à ces 4 statuts ni
+ * masquées.
+ */
+const ACTIVE_STATUSES = ['NEW', 'ACCEPTED', 'PREPARING', 'READY'];
+const COLUMN_LABELS = {
+  NEW: 'Nouvelles',
+  ACCEPTED: 'Acceptées',
+  PREPARING: 'Préparation',
+  READY: 'Prêtes'
+};
+
+installGlobalErrorLogging(supabase, {
+  page: 'admin',
+  getRestaurantId: () => restaurant?.id ?? null
+});
+
+/*
+ * Bloc 5.4 : reprise déterministe au retour au premier plan et sur les
+ * transitions réseau du navigateur. Safari/iOS suspend agressivement
+ * les timers et peut geler un WebSocket sans jamais délivrer son
+ * événement de fermeture tant que l'onglet reste en arrière-plan --
+ * d'où la rafale de CLOSED observée en prod, tous horodatés au moment
+ * du retour au premier plan plutôt qu'au moment réel de la coupure.
+ *
+ * `render()` est appelé ici indépendamment de realtimeManager : même si
+ * le channel semble sain (SUBSCRIBED jamais retombé), on revérifie
+ * quand même la liste des commandes, au cas où l'événement aurait été
+ * perdu silencieusement pendant la suspension.
+ */
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && mode === 'remote') {
+      render();
+      realtimeManager.healthCheck();
+    }
+  });
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pageshow', () => {
+    if (mode === 'remote') {
+      render();
+      realtimeManager.healthCheck();
+    }
+  });
+  window.addEventListener('online', () => {
+    if (mode === 'remote') {
+      render();
+      realtimeManager.handleOnline();
+    }
+  });
+  window.addEventListener('offline', () => {
+    realtimeManager.handleOffline();
+  });
+}
+
 function localOrders() {
   return JSON.parse(
     localStorage.getItem('caz-food-orders') || '[]'
@@ -76,93 +279,118 @@ async function init() {
     }
     remote = createSupabaseOrderStore(supabase, restaurant.id);
     mode = 'remote';
-    subscribeRealtime();
+    realtimeManager.start();
     await render();
     return;
   }
   renderLogin();
 }
-function subscribeRealtime() {
-  if (
-    realtimeChannel &&
-    supabase
-  ) {
-    supabase.removeChannel(
-      realtimeChannel
-    );
+
+/**
+ * Source unique de vérité pour l'état de connexion affiché : le
+ * badge du header et la note en bas de page doivent toujours
+ * raconter la même chose, donc un seul mapping état -> libellés,
+ * jamais deux (c'était le bug : le footer testait `mode === 'remote'`
+ * indépendamment du badge, et disait "Temps réel actif" même en
+ * 'connecting'/'reconnecting').
+ */
+const CONNECTION_STATES = {
+  live: {
+    badge: 'En direct',
+    badgeClass: 'is-live',
+    footnote: 'Temps réel actif. Les nouvelles commandes apparaissent automatiquement.'
+  },
+  connecting: {
+    badge: 'Connexion…',
+    badgeClass: 'is-connecting',
+    footnote: 'Connexion au temps réel en cours…'
+  },
+  reconnecting: {
+    badge: 'Reconnexion…',
+    badgeClass: 'is-reconnecting',
+    footnote: 'Connexion perdue, reconnexion en cours (commandes toujours à jour par vérification périodique).'
+  },
+  offline: {
+    badge: 'Hors ligne',
+    badgeClass: 'is-offline',
+    footnote: 'Aucune connexion réseau. Reprise automatique dès que la connexion revient.'
+  },
+  local: {
+    badge: 'Mode démo local',
+    badgeClass: 'is-local',
+    footnote: 'Mode démo local.'
   }
-  /*
-   * IMPORTANT :
-   *
-   * S'abonner tout de suite après signInAdmin()/
-   * getAdminSession() peut, selon le timing, créer
-   * le canal avant que le token soit propagé au
-   * client realtime, et donc s'abonner en tant
-   * qu'anon (aucun droit de lecture sur orders,
-   * donc aucun événement ne remonte, sans erreur).
-   *
-   * On force explicitement l'auth du client realtime
-   * avec le token de session avant de créer le canal.
-   */
-  if (
-    supabase &&
-    session?.access_token
-  ) {
-    supabase.realtime.setAuth(
-      session.access_token
-    );
+};
+
+function getConnectionState() {
+  return mode !== 'remote' ? 'local' : realtimeManager.getStatus();
+}
+
+/**
+ * Reflète l'état de connexion (badge + note du footer) sans passer
+ * par un render() complet (cet état change indépendamment de la
+ * liste des commandes). Best-effort : si un élément n'est pas encore
+ * dans le DOM (avant le premier render), ce patch-là est ignoré.
+ */
+function updateConnectionBadge() {
+  const config =
+    CONNECTION_STATES[getConnectionState()] ??
+    CONNECTION_STATES.connecting;
+
+  const badgeEl = document.querySelector('#counter-live-badge');
+  if (badgeEl) {
+    badgeEl.textContent = config.badge;
+    badgeEl.className = `oi-counter-live ${config.badgeClass}`;
   }
-  realtimeChannel =
-    subscribeToOrderChanges(
-      supabase,
-      () => render(),
-      (status) => {
-        const dropped =
-          status === 'CLOSED' ||
-          status === 'TIMED_OUT' ||
-          status === 'CHANNEL_ERROR';
-        if (
-          dropped &&
-          mode === 'remote'
-        ) {
-          console.warn(
-            '[Realtime] Reconnexion dans 3s...'
-          );
-          logClientError(supabase, {
-            restaurantId: restaurant?.id,
-            context: 'admin.realtime',
-            message: `Canal realtime perdu (${status}), reconnexion dans 3s`,
-            page: 'admin'
-          });
-          setTimeout(() => {
-            if (mode === 'remote') {
-              subscribeRealtime();
-            }
-          }, 3000);
-        }
-      }
-    );
+
+  const footnoteEl = document.querySelector('#counter-footnote-text');
+  if (footnoteEl) {
+    footnoteEl.textContent = config.footnote;
+  }
+}
+
+/**
+ * Notification discrète (pas de son : aucun mécanisme sonore
+ * n'existait avant ce bloc, on n'en ajoute pas ici) affichée à la
+ * réception d'un événement INSERT réel via Realtime. Attachée à
+ * document.body (comme les autres overlays de ce fichier) pour
+ * survivre au réarment complet de #admin-root par render().
+ */
+function showNewOrderToast() {
+  let el = document.querySelector('#counter-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'counter-toast';
+    el.className = 'oi-counter-toast';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    document.body.appendChild(el);
+  }
+  el.textContent = 'Nouvelle commande reçue';
+  el.classList.remove('is-visible');
+  void el.offsetWidth;
+  el.classList.add('is-visible');
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => {
+    el.classList.remove('is-visible');
+  }, 4000);
 }
 function renderSetup() {
   root.innerHTML = `
     <main class="admin-auth">
       <div class="auth-card">
         <div class="auth-mark">
-          CF
+          F
         </div>
         <p class="eyebrow">
-          CAZ FOOD · CONFIGURATION
+          FOODATOI · CONFIGURATION
         </p>
         <h1>
           Le comptoir<br>
           <em>arrive bientôt.</em>
         </h1>
         <p>
-          Ajoute
-          <code>VITE_SUPABASE_URL</code>
-          et
-          <code>VITE_SUPABASE_PUBLISHABLE_KEY</code>
-          dans Netlify pour activer le compte commerçant.
+          La configuration du compte commerçant n'est pas encore terminée.
         </p>
       </div>
     </main>
@@ -173,10 +401,10 @@ function renderRestaurantError(error) {
     <main class="admin-auth">
       <div class="auth-card">
         <div class="auth-mark">
-          CF
+          F
         </div>
         <p class="eyebrow">
-          CAZ FOOD · LE COMPTOIR
+          FOODATOI · LE COMPTOIR
         </p>
         <h1>
           Restaurant introuvable.
@@ -209,16 +437,16 @@ function renderLogin(error = '') {
     <main class="admin-auth">
       <div class="auth-card">
         <div class="auth-mark">
-          CF
+          F
         </div>
         <p class="eyebrow">
-          CAZ FOOD · LE COMPTOIR
+          FOODATOI · LE COMPTOIR
         </p>
         <h1>
           Bon retour.
         </h1>
         <p>
-          Connexion réservée à l'équipe Caz Food.
+          Connexion réservée à l'équipe du restaurant.
         </p>
         ${
           error
@@ -315,7 +543,7 @@ function renderLogin(error = '') {
             restaurant.id
           );
         mode = 'remote';
-        subscribeRealtime();
+        realtimeManager.start();
         await render();
       } catch (error) {
         console.error(
@@ -340,14 +568,24 @@ async function getOrders() {
   }
   return localOrders();
 }
-async function advance(order) {
+async function advance(order, button) {
   const next = {
     NEW: 'ACCEPTED',
     ACCEPTED: 'PREPARING',
     PREPARING: 'READY'
   }[order.status];
-  if (!next) {
+  if (
+    !next ||
+    pendingStatusChanges.has(order.id)
+  ) {
     return;
+  }
+  pendingStatusChanges.add(order.id);
+  const originalLabel = button?.innerHTML ?? '';
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Mise à jour…';
   }
   try {
     if (mode === 'remote') {
@@ -364,8 +602,10 @@ async function advance(order) {
         )
       );
     }
+    pendingStatusChanges.delete(order.id);
     await render();
   } catch (error) {
+    pendingStatusChanges.delete(order.id);
     console.error(
       'Erreur changement statut:',
       error
@@ -384,7 +624,134 @@ async function advance(order) {
     alert(
       'Impossible de modifier le statut de la commande.'
     );
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+      button.textContent = originalLabel;
+    }
   }
+}
+async function toggleDelivery(order, button) {
+  if (
+    mode !== 'remote' ||
+    pendingDeliveryChanges.has(order.id)
+  ) {
+    return;
+  }
+  const next =
+    order.delivery_status === 'TO_DELIVER'
+      ? 'DELIVERED'
+      : 'TO_DELIVER';
+  pendingDeliveryChanges.add(order.id);
+  const originalLabel = button?.innerHTML ?? '';
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Mise à jour…';
+  }
+  try {
+    await remote.updateDeliveryStatus(
+      order.id,
+      next
+    );
+    pendingDeliveryChanges.delete(order.id);
+    await render();
+  } catch (error) {
+    pendingDeliveryChanges.delete(order.id);
+    console.error(
+      'Erreur changement statut livraison:',
+      error
+    );
+    logClientError(supabase, {
+      restaurantId: restaurant?.id,
+      context: 'admin.updateDeliveryStatus',
+      message: error?.message ?? String(error),
+      details: {
+        orderId: order.id,
+        from: order.delivery_status,
+        to: next
+      },
+      page: 'admin'
+    });
+    alert(
+      'Impossible de modifier le statut de livraison.'
+    );
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+      button.textContent = originalLabel;
+    }
+  }
+}
+
+/**
+ * "À l'instant" / "Il y a N min" / "Il y a N h" à partir de
+ * created_at (jamais stocké, recalculé côté client). Fonction pure
+ * pour rester testable, `now` en paramètre plutôt que Date.now() en
+ * dur.
+ */
+function formatOrderAge(createdAt, now = new Date()) {
+  if (!createdAt) {
+    return '';
+  }
+  const created = new Date(createdAt);
+  if (Number.isNaN(created.getTime())) {
+    return '';
+  }
+  const diffMinutes = Math.max(
+    0,
+    Math.round((now.getTime() - created.getTime()) / 60000)
+  );
+  if (diffMinutes < 1) {
+    return "À l'instant";
+  }
+  if (diffMinutes < 60) {
+    return `Il y a ${diffMinutes} min`;
+  }
+  const diffHours = Math.round(diffMinutes / 60);
+  return `Il y a ${diffHours} h`;
+}
+
+/**
+ * Rafraîchit uniquement le texte des pastilles d'ancienneté déjà
+ * dans le DOM, sans re-render()/re-fetch : évite de rappeler
+ * getOrders() (Supabase) toutes les 30s juste pour un texte relatif.
+ * Démarré une seule fois (voir render()).
+ */
+function tickOrderAges() {
+  document
+    .querySelectorAll('.oi-counter-age[data-created-at]')
+    .forEach((el) => {
+      el.textContent = formatOrderAge(el.dataset.createdAt);
+    });
+}
+function ensureAgeTicker() {
+  if (ageTickerHandle) {
+    return;
+  }
+  ageTickerHandle = setInterval(tickOrderAges, 30000);
+}
+
+/**
+ * Options d'un article de commande, jointes en une seule ligne
+ * lisible ("Poulet · Algérienne"), jamais en JSON brut. Partagée par
+ * orderCard() et renderOrderDetail() (auparavant dupliquée en ligne
+ * dans renderOrderDetail() uniquement) — même champs lus, aucune
+ * option métier perdue.
+ */
+function formatOrderItemOptions(item) {
+  return [
+    item.options?.meat,
+    item.options?.sauce,
+    item.options?.drink,
+    ...(Array.isArray(item.options?.groups)
+      ? item.options.groups.map((g) =>
+          g && g.label && g.choice ? `${g.label}: ${g.choice}` : null
+        )
+      : [])
+  ]
+    .filter(Boolean)
+    .join(' · ');
 }
 async function render() {
   if (
@@ -408,36 +775,50 @@ async function render() {
             a.createdAt
           )
       );
-  const total =
-    data.reduce(
-      (sum, order) =>
-        sum +
-        Number(
-          order.total ??
-          (order.total_cents ?? 0) /
-            100
-        ),
-      0
-    );
+  /*
+   * Regroupement par statut réel (voir orderWorkflow.mjs) : les 4
+   * statuts actionnables forment le tableau de service principal ;
+   * tout le reste (CANCELLED aujourd'hui, ou un statut futur non
+   * géré côté client) reste visible mais à part, jamais mélangé ni
+   * masqué.
+   */
+  const grouped = {
+    NEW: [],
+    ACCEPTED: [],
+    PREPARING: [],
+    READY: []
+  };
+  const other = [];
+
+  data.forEach((order) => {
+    if (ACTIVE_STATUSES.includes(order.status)) {
+      grouped[order.status].push(order);
+    } else {
+      other.push(order);
+    }
+  });
+
+  const hasActiveOrders = ACTIVE_STATUSES.some(
+    (status) => grouped[status].length > 0
+  );
+
+  const savings = calculateUberEatsSavings(
+    data,
+    restaurant?.settings?.uber_eats_commission_rate
+  );
+
   root.innerHTML = `
-    <main class="admin-shell">
-      <header class="admin-header">
-        <div>
-          <p class="eyebrow">
-            CAZ FOOD · SERVICE
-          </p>
-          <h1>
-            Le comptoir.
-          </h1>
-          <p>
-            ${
-              mode === 'remote'
-                ? 'Commandes en direct · Supabase Realtime'
-                : 'Mode démo local'
-            }
-          </p>
+    <main class="admin-shell oi-counter-shell">
+      <header class="oi-counter-header">
+        <div class="oi-counter-identity">
+          <span class="oi-counter-eyebrow">FOODATOI</span>
+          <strong class="oi-counter-name">${escapeHtml(restaurant?.name || 'Restaurant')}</strong>
         </div>
-        <div class="admin-actions">
+        <div class="oi-counter-status">
+          <span class="oi-counter-role">Comptoir</span>
+          <span id="counter-live-badge" class="oi-counter-live"></span>
+        </div>
+        <div class="admin-actions oi-counter-tools">
           <button
             class="secondary"
             id="system-health"
@@ -449,6 +830,19 @@ async function render() {
             id="export-stock"
           >
             Exporter (CSV)
+          </button>
+          <button
+            class="secondary"
+            id="export-accounting"
+          >
+            Export comptable
+          </button>
+          <button
+            class="secondary"
+            id="connect-printer"
+            hidden
+          >
+            Connecter l'imprimante
           </button>
           <button
             class="secondary"
@@ -470,71 +864,11 @@ async function render() {
           </a>
         </div>
       </header>
-      <section class="admin-stats">
-        <div>
-          <span>
-            À prendre en charge
-          </span>
-          <strong>
-            ${
-              data.filter(
-                order =>
-                  order.status ===
-                  'NEW'
-              ).length
-            }
-          </strong>
-        </div>
-        <div>
-          <span>
-            En préparation
-          </span>
-          <strong>
-            ${
-              data.filter(
-                order =>
-                  order.status ===
-                  'PREPARING'
-              ).length
-            }
-          </strong>
-        </div>
-        <div>
-          <span>
-            Prêtes
-          </span>
-          <strong>
-            ${
-              data.filter(
-                order =>
-                  order.status ===
-                  'READY'
-              ).length
-            }
-          </strong>
-        </div>
-        <div>
-          <span>
-            Commandé
-          </span>
-          <strong>
-            ${euro(total)}
-          </strong>
-        </div>
-      </section>
+
       ${
-        (() => {
-          const savings =
-            calculateUberEatsSavings(
-              data,
-              restaurant?.settings
-                ?.uber_eats_commission_rate
-            );
-          if (!savings || !savings.orderCount) {
-            return '';
-          }
-          return `
-            <section class="roi-banner">
+        savings && savings.orderCount
+          ? `
+            <section class="roi-banner oi-counter-roi">
               <p class="eyebrow">
                 VOTRE ÉCONOMIE FOODATOI
               </p>
@@ -549,41 +883,122 @@ async function render() {
                 intégralement chez vous.
               </p>
             </section>
-          `;
-        })()
+          `
+          : ''
       }
-      <section class="orders-grid">
-        ${
-          data.length
-            ? data
-                .map(orderCard)
-                .join('')
-            : `
-              <div class="empty-ticket admin-empty">
-                <div class="empty-ticket-mark">
-                  +
-                </div>
-                <h2>
-                  Le comptoir est calme.
-                </h2>
-                <p>
-                  La prochaine commande apparaîtra ici
-                  dès qu'elle sera envoyée.
-                </p>
+
+      ${
+        hasActiveOrders
+          ? `
+            <nav class="oi-counter-tabs" role="tablist" aria-label="Filtrer par état">
+              ${ACTIVE_STATUSES.map(
+                (status) => `
+                  <button
+                    type="button"
+                    role="tab"
+                    class="oi-counter-tab${activeMobileTab === status ? ' is-active' : ''}"
+                    aria-selected="${activeMobileTab === status}"
+                    data-tab="${status}"
+                  >
+                    ${COLUMN_LABELS[status]}
+                    <span class="oi-counter-tab-count">${grouped[status].length}</span>
+                  </button>
+                `
+              ).join('')}
+            </nav>
+
+            <section class="oi-counter-board" data-active="${activeMobileTab}">
+              ${ACTIVE_STATUSES.map(
+                (status) => `
+                  <div class="oi-counter-column" data-status="${status}">
+                    <h2 class="oi-counter-column-head">
+                      ${COLUMN_LABELS[status]}
+                      <span class="oi-counter-count">${grouped[status].length}</span>
+                    </h2>
+                    <div class="oi-counter-cards">
+                      ${
+                        grouped[status].length
+                          ? grouped[status].map(orderCard).join('')
+                          : `<p class="oi-counter-column-empty">Aucune commande.</p>`
+                      }
+                    </div>
+                  </div>
+                `
+              ).join('')}
+            </section>
+          `
+          : `
+            <div class="empty-ticket admin-empty oi-counter-empty">
+              <div class="empty-ticket-mark">
+                +
               </div>
-            `
-        }
-      </section>
-      <p class="admin-note">
+              <h2>
+                Aucune commande en attente
+              </h2>
+              <p>
+                Les nouvelles commandes apparaîtront ici automatiquement.
+              </p>
+            </div>
+          `
+      }
+
+      ${
+        other.length
+          ? `
+            <details class="oi-counter-archive">
+              <summary>Autres commandes (${other.length})</summary>
+              <div class="oi-counter-cards">
+                ${other.map(orderCard).join('')}
+              </div>
+            </details>
+          `
+          : ''
+      }
+
+      <p class="admin-note oi-counter-footnote">
         ●
-        ${
-          mode === 'remote'
-            ? 'Temps réel actif. Les nouvelles commandes apparaissent automatiquement.'
-            : 'Mode démo local.'
-        }
+        <span id="counter-footnote-text"></span>
       </p>
     </main>
   `;
+  updateConnectionBadge();
+  ensureAgeTicker();
+  root
+    .querySelectorAll(
+      '[data-tab]'
+    )
+    .forEach(tabButton => {
+      tabButton.onclick =
+        () => {
+          activeMobileTab =
+            tabButton.dataset.tab;
+          const board =
+            root.querySelector(
+              '.oi-counter-board'
+            );
+          if (board) {
+            board.dataset.active =
+              activeMobileTab;
+          }
+          root
+            .querySelectorAll(
+              '[data-tab]'
+            )
+            .forEach(otherTab => {
+              const isActive =
+                otherTab.dataset.tab ===
+                activeMobileTab;
+              otherTab.classList.toggle(
+                'is-active',
+                isActive
+              );
+              otherTab.setAttribute(
+                'aria-selected',
+                String(isActive)
+              );
+            });
+        };
+    });
   const logout =
     root.querySelector(
       '#logout'
@@ -592,14 +1007,7 @@ async function render() {
     logout.onclick =
       async () => {
         try {
-          if (
-            realtimeChannel &&
-            supabase
-          ) {
-            await supabase.removeChannel(
-              realtimeChannel
-            );
-          }
+          await realtimeManager.stop();
           if (supabase) {
             await signOutAdmin(
               supabase
@@ -610,7 +1018,10 @@ async function render() {
           restaurant = null;
           remote = null;
           mode = 'local';
-          realtimeChannel = null;
+          if (ageTickerHandle) {
+            clearInterval(ageTickerHandle);
+            ageTickerHandle = null;
+          }
           renderLogin();
         }
       };
@@ -633,7 +1044,7 @@ async function render() {
                 )
             );
           if (order) {
-            advance(order);
+            advance(order, button);
           }
         };
     });
@@ -655,7 +1066,29 @@ async function render() {
                 )
             );
           if (order) {
-            printOrder(order);
+            printOrderSmart(order, restaurant?.name);
+          }
+        };
+    });
+  root
+    .querySelectorAll(
+      '[data-toggle-delivery]'
+    )
+    .forEach(button => {
+      button.onclick =
+        () => {
+          const order =
+            data.find(
+              item =>
+                String(
+                  item.id ?? ''
+                ) ===
+                String(
+                  button.dataset.id
+                )
+            );
+          if (order) {
+            toggleDelivery(order, button);
           }
         };
     });
@@ -667,6 +1100,34 @@ async function render() {
     exportButton.onclick =
       () => downloadStockSummaryCsv(data);
   }
+  const accountingExportButton =
+    root.querySelector(
+      '#export-accounting'
+    );
+  if (accountingExportButton) {
+    accountingExportButton.onclick =
+      () => openAccountingExportModal(data);
+  }
+  const connectPrinterButton =
+    root.querySelector(
+      '#connect-printer'
+    );
+  if (connectPrinterButton && thermalPrinter) {
+    connectPrinterButton.hidden = false;
+    connectPrinterButton.textContent = thermalPrinter.isConnected()
+      ? `Imprimante : ${thermalPrinter.getDeviceInfo()?.productName || 'connectée'}`
+      : "Connecter l'imprimante";
+    connectPrinterButton.onclick = async () => {
+      connectPrinterButton.textContent = 'Connexion…';
+      try {
+        await thermalPrinter.connect();
+        connectPrinterButton.textContent = `Imprimante : ${thermalPrinter.getDeviceInfo()?.productName || 'connectée'}`;
+      } catch (err) {
+        console.error('[FOODATOI admin] Connexion imprimante annulée ou échouée:', err);
+        connectPrinterButton.textContent = "Connecter l'imprimante";
+      }
+    };
+  }
   const healthButton =
     root.querySelector(
       '#system-health'
@@ -674,6 +1135,25 @@ async function render() {
   if (healthButton) {
     healthButton.onclick =
       () => renderSystemHealth();
+    // Badge : nombre d'erreurs des dernières 24 h, pour que le comptoir
+    // remarque un incident sans ouvrir la modale. Best-effort — en cas
+    // d'échec, getRecentErrors a déjà tracé via console.error (filet
+    // global), donc rien n'est perdu ici.
+    if (mode === 'remote' && remote?.getRecentErrors) {
+      remote
+        .getRecentErrors()
+        .then((errors) => {
+          const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+          const recent = errors.filter(
+            (e) => new Date(e.created_at).getTime() > dayAgo
+          ).length;
+          if (recent > 0) {
+            healthButton.textContent = `État système (${recent})`;
+            healthButton.classList.add('has-errors');
+          }
+        })
+        .catch(() => {});
+    }
   }
   const printStockButton =
     root.querySelector(
@@ -685,7 +1165,8 @@ async function render() {
         printStockSummary(
           aggregateOrderItems(data),
           {
-            rangeLabel: `${data.length} commande${data.length > 1 ? 's' : ''} affichée${data.length > 1 ? 's' : ''}`
+            rangeLabel: `${data.length} commande${data.length > 1 ? 's' : ''} affichée${data.length > 1 ? 's' : ''}`,
+            restaurantName: restaurant?.name
           }
         );
   }
@@ -736,12 +1217,69 @@ function downloadStockSummaryCsv(orders) {
   const link =
     document.createElement('a');
   link.href = url;
-  link.download = `caz-food-stock-${new Date()
+  link.download = `${restaurantFilePrefix()}-stock-${new Date()
     .toISOString()
     .slice(0, 10)}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
+
+function restaurantFilePrefix() {
+  return (restaurant?.name || 'foodatoi')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'foodatoi';
+}
+
+function downloadAccountingCsv(orders, from, to) {
+  const filtered = filterOrdersByDateRange(orders, from, to);
+  const csv = buildAccountingCsv(filtered);
+  const blob = new Blob(
+    ['\uFEFF' + csv],
+    { type: 'text/csv;charset=utf-8;' }
+  );
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  const suffix = from || to
+    ? `${from || 'debut'}_${to || 'fin'}`
+    : new Date().toISOString().slice(0, 10);
+  link.download = `${restaurantFilePrefix()}-comptabilite-${suffix}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function openAccountingExportModal(orders) {
+  const overlay = document.createElement('div');
+  overlay.id = 'accounting-export-overlay';
+  overlay.className = 'modal';
+  overlay.innerHTML = `
+    <div class="modal-card">
+      <button class="modal-close" id="close-accounting-export">×</button>
+      <p class="eyebrow">EXPORT COMPTABLE</p>
+      <h2>Choisis une période</h2>
+      <p>Laisse les deux champs vides pour tout exporter.</p>
+      <form id="accounting-export-form" class="order-form">
+        <label>DU<input type="date" name="from"></label>
+        <label>AU<input type="date" name="to"></label>
+        <button class="primary full" type="submit">Télécharger le CSV</button>
+      </form>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  document.querySelector('#close-accounting-export').onclick = () => overlay.remove();
+
+  document.querySelector('#accounting-export-form').onsubmit = (event) => {
+    event.preventDefault();
+    const fields = Object.fromEntries(new FormData(event.currentTarget));
+    downloadAccountingCsv(orders, fields.from || null, fields.to || null);
+    overlay.remove();
+  };
+}
+
 function closeOrderDetail() {
   const overlay =
     document.querySelector(
@@ -788,18 +1326,18 @@ async function renderOrderDetail(order) {
         }
       </p>
       <h2>
-        ${
+        ${escapeHtml(
           order.customer?.name ??
           order.customer_name ??
           'Client'
-        }
+        )}
       </h2>
       <p>
-        ${
+        ${escapeHtml(
           order.customer?.phone ??
           order.customer_phone ??
           '—'
-        }
+        )}
         · retrait
         ${
           formatPickupTime(
@@ -816,23 +1354,17 @@ async function renderOrderDetail(order) {
                   <td>
                     <strong>
                       ${item.quantity}×
-                      ${
+                      ${escapeHtml(
                         item.name ??
                         item.product_name ??
                         'Article'
-                      }
+                      )}
                     </strong>
                     <br>
                     <small>
-                      ${
-                        [
-                          item.options?.meat,
-                          item.options?.sauce,
-                          item.options?.drink
-                        ]
-                          .filter(Boolean)
-                          .join(' · ') || '—'
-                      }
+                      ${escapeHtml(
+                        formatOrderItemOptions(item) || '—'
+                      )}
                     </small>
                   </td>
                   <td class="num">
@@ -906,7 +1438,7 @@ async function renderOrderDetail(order) {
     .querySelector(
       '#print-from-detail'
     ).onclick = () =>
-    printOrder(order);
+    printOrderSmart(order, restaurant?.name);
   if (
     mode === 'remote' &&
     remote?.getOrderEvents
@@ -1046,40 +1578,52 @@ async function renderSystemHealth() {
         '#health-loading'
       );
     if (!loadingEl) return;
+    const byContext = errors.reduce((acc, e) => {
+      const key = e.context || '—';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    const summary = Object.entries(byContext)
+      .sort((a, b) => b[1] - a[1])
+      .map(([ctx, n]) => `${escapeHtml(ctx)} (${n})`)
+      .join(' · ');
     loadingEl.outerHTML = errors.length
       ? `
         <p>
           ${errors.length} erreur${errors.length > 1 ? 's' : ''}
           enregistrée${errors.length > 1 ? 's' : ''}, la plus récente en premier.
         </p>
+        <p class="health-summary">${summary}</p>
         <ul class="detail-timeline-list health-list">
           ${errors
-            .map(
-              (err) => `
+            .map((err) => {
+              const when = new Date(err.created_at).toLocaleString('fr-FR', {
+                day: '2-digit',
+                month: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+              });
+              const stack =
+                err.details && err.details.stack
+                  ? String(err.details.stack)
+                  : '';
+              return `
                 <li>
-                  <span>
-                    ${new Date(
-                      err.created_at
-                    ).toLocaleString(
-                      'fr-FR',
-                      {
-                        day: '2-digit',
-                        month: '2-digit',
-                        hour: '2-digit',
-                        minute: '2-digit'
-                      }
-                    )}
-                  </span>
+                  <span>${when}</span>
                   <div>
-                    <strong>
-                      ${err.context ?? '—'}
-                    </strong>
+                    <strong>${escapeHtml(err.context ?? '—')}</strong>
+                    ${err.page ? ` · <em>${escapeHtml(err.page)}</em>` : ''}
                     <br>
-                    ${err.message ?? ''}
+                    ${escapeHtml(err.message ?? '')}
+                    ${
+                      stack
+                        ? `<details class="health-stack"><summary>détails</summary><pre>${escapeHtml(stack)}</pre></details>`
+                        : ''
+                    }
                   </div>
                 </li>
-              `
-            )
+              `;
+            })
             .join('')}
         </ul>
       `
@@ -1145,106 +1689,158 @@ function orderCard(order) {
     order.total ??
     (order.total_cents ?? 0) /
       100;
+  const isDelivery =
+    order.fulfillment_type ===
+    'DELIVERY';
+  const deliveryAddress =
+    order.delivery_address ??
+    null;
+  const deliveryStatus =
+    order.delivery_status;
   const actionLabel =
     getNextStatusLabel(
       status
     );
-  const action =
-    actionLabel
+  let action;
+  if (actionLabel) {
+    action = `
+      <button
+        class="primary"
+        data-next
+        data-id="${order.id}"
+      >
+        ${actionLabel} →
+      </button>
+    `;
+  } else if (status === 'READY') {
+    action = `
+      <span class="ready-badge">
+        ✓ Prête${
+          isDelivery
+            ? ', à livrer'
+            : ' pour retrait'
+        }
+      </span>
+    `;
+  } else {
+    /*
+     * Statut sans action suivante ET différent de READY (ex.
+     * CANCELLED) : auparavant affiché à tort comme "✓ Prête" (le
+     * badge par défaut ne distinguait pas ce cas). On affiche
+     * désormais le vrai statut, jamais une confirmation inventée.
+     */
+    action = `
+      <span class="oi-counter-terminal-badge">
+        ${escapeHtml(labels[status] ?? status)}
+      </span>
+    `;
+  }
+  const deliveryToggle =
+    isDelivery
       ? `
         <button
-          class="primary"
-          data-next
+          class="delivery-toggle${
+            deliveryStatus ===
+            'DELIVERED'
+              ? ' is-delivered'
+              : ''
+          }"
+          data-toggle-delivery
           data-id="${order.id}"
         >
-          ${actionLabel} →
+          ${
+            deliveryLabels[
+              deliveryStatus
+            ] ??
+            deliveryLabels.TO_DELIVER
+          }
         </button>
       `
-      : `
-        <span class="ready-badge">
-          ✓ Prête pour retrait
-        </span>
-      `;
+      : '';
+  const createdAt =
+    order.created_at ??
+    order.createdAt ??
+    null;
+  const modeLabel =
+    isDelivery ? 'Livraison' : 'Retrait';
+  const slotLine =
+    customer.pickupTime && customer.pickupTime !== '—'
+      ? `${modeLabel} ${customer.pickupTime}`
+      : '';
   return `
     <article
-      class="order-card status-${String(
+      class="order-card oi-counter-card status-${String(
         status
       ).toLowerCase()}"
       data-order="${order.id}"
     >
-      <header>
-        <div>
-          <span class="order-number">
-            ${number}
-          </span>
-          <span class="status">
-            ${
-              labels[status] ??
-              status
-            }
-          </span>
-        </div>
-        <strong>
-          ${
-            customer.pickupTime ||
-            '—'
-          }
-        </strong>
+      <header class="oi-counter-card-head">
+        <span class="oi-counter-number">
+          ${escapeHtml(number)}
+        </span>
+        ${
+          createdAt
+            ? `<span class="oi-counter-age" data-created-at="${escapeHtml(createdAt)}">${escapeHtml(formatOrderAge(createdAt))}</span>`
+            : ''
+        }
       </header>
-      <div class="order-customer">
+      <p class="oi-counter-mode">
+        <span class="oi-counter-mode-tag">${modeLabel}</span>
+        ${slotLine ? `<span class="oi-counter-slot">${escapeHtml(slotLine)}</span>` : ''}
+        <span class="oi-counter-status-tag">${escapeHtml(labels[status] ?? status)}</span>
+      </p>
+      <div class="oi-counter-customer">
         <strong>
-          ${customer.name}
+          ${escapeHtml(customer.name)}
         </strong>
         <span>
-          ${customer.phone}
+          ${escapeHtml(customer.phone)}
         </span>
       </div>
       ${
+        isDelivery && deliveryAddress
+          ? `
+            <div class="order-delivery">
+              <span>
+                ${escapeHtml(deliveryAddress.street ?? '')},
+                ${escapeHtml(deliveryAddress.postal_code ?? '')}
+                ${escapeHtml(deliveryAddress.city ?? '')}
+              </span>
+              ${
+                deliveryAddress.complement
+                  ? `<small>${escapeHtml(deliveryAddress.complement)}</small>`
+                  : ''
+              }
+            </div>
+          `
+          : ''
+      }
+      ${
         items.length
           ? `
-            <ul>
+            <ul class="oi-counter-items">
               ${items
-                .map(
-                  item => `
+                .map((item) => {
+                  const optionsLine =
+                    formatOrderItemOptions(item);
+                  return `
                     <li>
                       <strong>
                         ${item.quantity}×
                       </strong>
-                      ${
+                      ${escapeHtml(
                         item.name ??
                         item.product_name ??
                         'Article'
-                      }
+                      )}
                       ${
-                        item.options?.meat
-                          ? `
-                            <small>
-                              · ${item.options.meat}
-                            </small>
-                          `
-                          : ''
-                      }
-                      ${
-                        item.options?.sauce
-                          ? `
-                            <small>
-                              · ${item.options.sauce}
-                            </small>
-                          `
-                          : ''
-                      }
-                      ${
-                        item.options?.drink
-                          ? `
-                            <small>
-                              · ${item.options.drink}
-                            </small>
-                          `
+                        optionsLine
+                          ? `<small>${escapeHtml(optionsLine)}</small>`
                           : ''
                       }
                     </li>
-                  `
-                )
+                  `;
+                })
                 .join('')}
             </ul>
           `
@@ -1255,18 +1851,19 @@ function orderCard(order) {
           `
       }
       <footer>
-        <strong>
+        <strong class="oi-counter-total">
           ${euro(total)}
         </strong>
         <div class="order-actions">
           ${action}
+          ${deliveryToggle}
           <button
             class="print-button"
             data-print
             data-id="${order.id}"
             title="Imprimer le ticket"
           >
-            ⌁ TICKET
+            Ticket
           </button>
         </div>
       </footer>

@@ -10,4 +10,6 @@ assert.equal(order.type, 'PICKUP');
 assert.equal(order.number, '#123');
 assert.equal(order.customer.name, 'Kevin');
 assert.equal(order.total, 8);
+const deliveryOrder = createOrder([{ id: 'kebab', name: 'Kebab', price: 8, quantity: 1, options: {} }], { name: 'Kevin', phone: '0600000000', fulfillmentType: 'DELIVERY', deliveryStreet: '12 rue des Fleurs', deliveryPostalCode: '31000', deliveryCity: 'Toulouse' }, () => 124);
+assert.equal(deliveryOrder.type, 'DELIVERY');
 console.log('PASS');

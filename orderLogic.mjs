@@ -9,7 +9,7 @@ export function calculateTotal(items) {
 export function createOrder(items, customer, numberGenerator = () => Date.now()) {
   return {
     number: `#${numberGenerator()}`,
-    type: 'PICKUP',
+    type: customer?.fulfillmentType === 'DELIVERY' ? 'DELIVERY' : 'PICKUP',
     status: 'NEW',
     items,
     customer,

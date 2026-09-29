@@ -30,6 +30,34 @@ test('parisTimeToIsoDate rejects malformed input', () => {
   assert.equal(parisTimeToIsoDate(null), null);
 });
 
+test('parisTimeToIsoDate with an explicit future date lands on that date, not today', () => {
+  const iso = parisTimeToIsoDate('19:00', '2026-09-04');
+  const parisDate = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Paris',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date(iso));
+  assert.equal(parisDate, '2026-09-04');
+  assert.equal(formatPickupTime(iso), '19:00');
+});
+
+test('parisTimeToIsoDate rejects a malformed date string', () => {
+  assert.equal(parisTimeToIsoDate('19:00', '04-09-2026'), null);
+  assert.equal(parisTimeToIsoDate('19:00', 'not-a-date'), null);
+});
+
+test('parisTimeToIsoDate with no date argument still defaults to today (backward compatible)', () => {
+  const withoutDate = parisTimeToIsoDate('14:00');
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const withExplicitToday = parisTimeToIsoDate('14:00', todayStr);
+  // Les deux tombent sur le même jour Europe/Paris (peut différer de
+  // quelques millisecondes de construction, donc on compare le jour
+  // affiché plutôt que la chaîne ISO exacte).
+  assert.equal(formatPickupTime(withoutDate), formatPickupTime(withExplicitToday));
+});
+
 test('isRestaurantOpen returns true when no hours are configured (no restriction)', () => {
   assert.equal(isRestaurantOpen(null), true);
   assert.equal(isRestaurantOpen(undefined), true);

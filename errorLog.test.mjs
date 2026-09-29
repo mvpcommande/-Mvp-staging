@@ -66,3 +66,49 @@ test('logClientError is a no-op without a client (local/demo mode)', async () =>
     logClientError(null, { context: 'x', message: 'y' })
   );
 });
+
+test('installGlobalErrorLogging catalogue console.error, unhandledrejection et window.onerror', async () => {
+  const { client, inserted } = makeClient();
+  const handlers = {};
+  const realWin = globalThis.window;
+  const realErr = console.error;
+  const realWarn = console.warn;
+  globalThis.window = { addEventListener: (t, fn) => { handlers[t] = fn; } };
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  try {
+    const { installGlobalErrorLogging } = await import('./errorLog.mjs');
+    installGlobalErrorLogging(client, {
+      page: 'test',
+      getRestaurantId: () => 'rid-1'
+    });
+
+    console.error('console gap alpha', new Error('detail alpha'));
+    await tick();
+    const ce = inserted.map((i) => i[1]).find((r) => r.context === 'console.error');
+    assert.ok(ce, 'console.error catalogué');
+    assert.equal(ce.restaurant_id, 'rid-1');
+    assert.equal(ce.page, 'test');
+    assert.ok(ce.message.includes('console gap alpha'));
+
+    handlers.unhandledrejection({ reason: new Error('rejet bravo') });
+    await tick();
+    const ur = inserted.map((i) => i[1]).find((r) => r.context === 'unhandledrejection');
+    assert.ok(ur, 'unhandledrejection catalogué');
+    assert.ok(ur.message.includes('rejet bravo'));
+
+    handlers.error({
+      error: new Error('crash charlie'),
+      message: 'm', filename: 'f.js', lineno: 3, colno: 7
+    });
+    await tick();
+    const we = inserted.map((i) => i[1]).find((r) => r.context === 'window.onerror');
+    assert.ok(we, 'window.onerror catalogué');
+    assert.ok(we.message.includes('crash charlie'));
+  } finally {
+    console.error = realErr;
+    console.warn = realWarn;
+    if (realWin === undefined) delete globalThis.window; else globalThis.window = realWin;
+  }
+});

@@ -6,7 +6,7 @@ export default defineConfig({
   retries: 1,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'https://www.foodatoi.fr',
+    baseURL: 'https://mvpcommande.github.io/-Mvp-staging/',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure'
   },

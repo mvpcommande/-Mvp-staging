@@ -7,17 +7,18 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test *.test.mjs",
-    "test:e2e": "playwright test"
+    "test": "node --test *.test.mjs supabase/functions/_shared/rushour/*.test.mjs",
+    "test:e2e": "playwright test",
+    "test:db:rushour": "bash supabase/tests/rushour/run.sh",
+    "test:e2e:rushour-local": "bash supabase/tests/rushour/e2e/run-e2e-local.sh"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "vite": "latest",
-    "@supabase/supabase-js": "2.57.0"
+    "@point-of-sale/receipt-printer-encoder": "3.0.3",
+    "@point-of-sale/webusb-receipt-printer": "2.0.0",
+    "@supabase/supabase-js": "2.57.0",
+    "vite": "8.2.2"
   },
   "devDependencies": {
-    "@playwright/test": "latest"
+    "@playwright/test": "1.62.1"
   }
 }

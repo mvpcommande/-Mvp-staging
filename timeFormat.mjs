@@ -132,7 +132,7 @@ export function formatOpeningHours(openingHours) {
  * Convertit une heure HH:mm choisie par le client
  * (Europe/Paris, à la date du jour) en timestamp ISO UTC.
  */
-export function parisTimeToIsoDate(time) {
+export function parisTimeToIsoDate(time, dateStr = null) {
   if (
     !time ||
     !/^\d{2}:\d{2}$/.test(String(time))
@@ -153,11 +153,25 @@ export function parisTimeToIsoDate(time) {
     return null;
   }
 
-  const now = new Date();
+  let year;
+  let month;
+  let day;
 
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const day = now.getDate();
+  if (dateStr) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr))) {
+      return null;
+    }
+
+    const [y, m, d] = String(dateStr).split('-').map(Number);
+    year = y;
+    month = m - 1;
+    day = d;
+  } else {
+    const now = new Date();
+    year = now.getFullYear();
+    month = now.getMonth();
+    day = now.getDate();
+  }
 
   /*
    * On part d'une approximation UTC puis on calcule
